@@ -795,12 +795,6 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
     _IMPLICIT_ENV_VARS = {"CLAUDE_CODE_OAUTH_TOKEN"}
     pconfig = PROVIDER_REGISTRY.get(normalized)
     if pconfig and pconfig.auth_type == "api_key":
-        current_test = os.environ.get("PYTEST_CURRENT_TEST", "")
-        if (
-            current_test
-            and "test_returns_true_when_anthropic_env_var_set" not in current_test
-        ):
-            return False
         for env_var in pconfig.api_key_env_vars:
             if env_var in _IMPLICIT_ENV_VARS:
                 continue

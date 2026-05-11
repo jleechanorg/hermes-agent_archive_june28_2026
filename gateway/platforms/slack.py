@@ -158,9 +158,9 @@ class SlackAdapter(BasePlatformAdapter):
             # Create SSL context that accepts *.slack.com certificates
             # Required for Python 3.14+ which strictly validates hostname mismatch
             # between gateway.sock.slack.com and certificate SAN (slack.com, *.slack.com)
+            # We disable hostname checking but keep certificate verification enabled
             slack_ssl_context = ssl.create_default_context()
             slack_ssl_context.check_hostname = False
-            slack_ssl_context.verify_mode = ssl.CERT_NONE
 
             # First token is the primary — used for AsyncApp / Socket Mode
             primary_token = bot_tokens[0]
