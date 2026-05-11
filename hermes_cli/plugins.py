@@ -1442,6 +1442,52 @@ def get_pre_tool_call_directives(
     return block_message, (rewrite_args or None)
 
 
+def get_pre_tool_call_directives(
+    tool_name: str,
+    args: Optional[Dict[str, Any]],
+    task_id: str = "",
+    session_id: str = "",
+    tool_call_id: str = "",
+) -> "tuple[Optional[str], Optional[Dict[str, Any]]]":
+    """Fire ``pre_tool_call`` once and return (block_message, rewrite_args).
+
+    Plugins may return one of two directives from their ``pre_tool_call``
+    callback (first matching directive of each type wins):
+
+        {"action": "block",   "message": "Reason"}      -> block the call
+        {"action": "rewrite", "args":    {new_args}}     -> rewrite args
+
+    Both are checked in a single hook-fire to preserve the single-fire
+    contract: ``pre_tool_call`` executes exactly once per tool execution.
+    """
+    hook_results = invoke_hook(
+        "pre_tool_call",
+        tool_name=tool_name,
+        args=args if isinstance(args, dict) else {},
+        task_id=task_id,
+        session_id=session_id,
+        tool_call_id=tool_call_id,
+    )
+
+    block_message: Optional[str] = None
+    rewrite_args: Optional[Dict[str, Any]] = None
+
+    for result in hook_results:
+        if not isinstance(result, dict):
+            continue
+        action = result.get("action")
+        if action == "block" and block_message is None:
+            message = result.get("message")
+            if isinstance(message, str) and message:
+                block_message = message
+        elif action == "rewrite" and rewrite_args is None:
+            new_args = result.get("args")
+            if isinstance(new_args, dict):
+                rewrite_args = new_args
+
+    return block_message, rewrite_args
+
+
 def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
     """Return the global manager after ensuring plugin discovery has run.
 
