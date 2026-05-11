@@ -214,6 +214,10 @@ def make_runner(platform: Platform, session_entry: SessionEntry = None) -> "Gate
     runner._fallback_model = None
     runner._show_reasoning = False
 
+    runner._agent_cache_lock = MagicMock()
+    runner._agent_cache = {}
+    runner._session_model_overrides = {}
+    runner._queued_events = {}
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._handle_message_with_agent = AsyncMock(return_value="agent-handled-default")
@@ -221,6 +225,7 @@ def make_runner(platform: Platform, session_entry: SessionEntry = None) -> "Gate
     runner._send_voice_reply = AsyncMock()
     runner._capture_gateway_honcho_if_configured = lambda *a, **kw: None
     runner._emit_gateway_run_progress = AsyncMock()
+    runner._read_user_config = lambda: {"approvals": {"destructive_slash_confirm": False}}
 
     runner.pairing_store = MagicMock()
     runner.pairing_store._is_rate_limited = MagicMock(return_value=False)
