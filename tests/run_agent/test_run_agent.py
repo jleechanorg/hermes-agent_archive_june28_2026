@@ -2159,6 +2159,33 @@ class TestConcurrentToolExecution:
 
         assert json.loads(result) == {"error": "Blocked"}
 
+    def test_concurrent_rewrite_args_survive_prechecked_dispatch(self, agent, monkeypatch):
+        """Concurrent preflight should carry rewrite args into the actual tool call."""
+        tool_call = _mock_tool_call(name="web_search", arguments='{"q":"original"}', call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_pre_tool_call_directives",
+            lambda *args, **kwargs: (None, {"q": "rewritten"}),
+        )
+
+        seen = {}
+
+        def fake_handle(function_name, function_args, task_id, **kwargs):
+            seen["name"] = function_name
+            seen["args"] = function_args
+            seen["kwargs"] = kwargs
+            return json.dumps({"ok": True})
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        assert seen["name"] == "web_search"
+        assert seen["args"]["q"] == "rewritten"
+        assert len(messages) == 1
+        assert json.loads(messages[0]["content"]) == {"ok": True}
+
     def test_sequential_blocked_tool_skips_checkpoints_and_callbacks(self, agent, monkeypatch):
         """Sequential path: blocked tool should not trigger checkpoints or start callbacks."""
         tool_call = _mock_tool_call(name="write_file",

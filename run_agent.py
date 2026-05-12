@@ -10266,7 +10266,8 @@ class AIAgent:
 
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None, messages: list = None,
-                     pre_tool_block_checked: bool = False) -> str:
+                     pre_tool_block_checked: bool = False,
+                     pre_tool_rewrite_args: Optional[dict] = None) -> str:
         """Invoke a single tool and return the result string. No display logic.
 
         Handles both agent-level tools (todo, memory, etc.) and registry-dispatched
@@ -10285,6 +10286,8 @@ class AIAgent:
                     function_args = {**function_args, **rewrite_args}
             except Exception:
                 pass
+        elif pre_tool_rewrite_args:
+            function_args = {**function_args, **pre_tool_rewrite_args}
         if block_message is not None:
             return json.dumps({"error": block_message}, ensure_ascii=False)
 
@@ -10439,8 +10442,10 @@ class AIAgent:
                 except Exception:
                     pass
 
+            block_message = None
             block_result = None
             blocked_by_guardrail = False
+            rewrite_args = None
             try:
                 from hermes_cli.plugins import get_pre_tool_call_directives
                 block_message, rewrite_args = get_pre_tool_call_directives(
@@ -10449,7 +10454,7 @@ class AIAgent:
                 if rewrite_args:
                     function_args = {**function_args, **rewrite_args}
             except Exception:
-                block_message = None
+                pass
 
             if block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)
@@ -10459,13 +10464,13 @@ class AIAgent:
                     block_result = self._guardrail_block_result(guardrail_decision)
                     blocked_by_guardrail = True
 
-            parsed_calls.append((tool_call, function_name, function_args, block_result, blocked_by_guardrail))
+            parsed_calls.append((tool_call, function_name, function_args, block_result, blocked_by_guardrail, rewrite_args))
 
         # ── Logging / callbacks ──────────────────────────────────────────
-        tool_names_str = ", ".join(name for _, name, _, _, _ in parsed_calls)
+        tool_names_str = ", ".join(name for _, name, _, _, _, _ in parsed_calls)
         if not self.quiet_mode:
             print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
-            for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls, 1):
+            for i, (tc, name, args, block_result, blocked_by_guardrail, rewrite_args) in enumerate(parsed_calls, 1):
                 args_str = json.dumps(args, ensure_ascii=False)
                 if self.verbose_logging:
                     print(f"  📞 Tool {i}: {name}({list(args.keys())})")
@@ -10474,7 +10479,7 @@ class AIAgent:
                     args_preview = args_str[:self.log_prefix_chars] + "..." if len(args_str) > self.log_prefix_chars else args_str
                     print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
 
-        for tc, name, args, block_result, blocked_by_guardrail in parsed_calls:
+        for tc, name, args, block_result, blocked_by_guardrail, rewrite_args in parsed_calls:
             if block_result is not None:
                 continue
             if self.tool_progress_callback:
@@ -10484,7 +10489,7 @@ class AIAgent:
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
-        for tc, name, args, block_result, blocked_by_guardrail in parsed_calls:
+        for tc, name, args, block_result, blocked_by_guardrail, rewrite_args in parsed_calls:
             if block_result is not None:
                 continue
             if self.tool_start_callback:
@@ -10496,7 +10501,7 @@ class AIAgent:
         # ── Concurrent execution ─────────────────────────────────────────
         # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag)
         results = [None] * num_tools
-        for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
+        for i, (tc, name, args, block_result, blocked_by_guardrail, rewrite_args) in enumerate(parsed_calls):
             if block_result is not None:
                 results[i] = (name, args, block_result, 0.0, True, True)
 
@@ -10513,7 +10518,7 @@ class AIAgent:
         _parent_approval_cb = _get_approval_callback()
         _parent_sudo_cb = _get_sudo_password_callback()
 
-        def _run_tool(index, tool_call, function_name, function_args):
+        def _run_tool(index, tool_call, function_name, function_args, pre_tool_rewrite_args):
             """Worker function executed in a thread."""
             # Register this worker tid so the agent can fan out an interrupt
             # to it — see AIAgent.interrupt().  Must happen first thing, and
@@ -10560,6 +10565,7 @@ class AIAgent:
                     tool_call.id,
                     messages=messages,
                     pre_tool_block_checked=True,
+                    pre_tool_rewrite_args=pre_tool_rewrite_args,
                 )
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
@@ -10597,18 +10603,18 @@ class AIAgent:
 
         try:
             runnable_calls = [
-                (i, tc, name, args)
-                for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls)
+                (i, tc, name, args, rewrite_args)
+                for i, (tc, name, args, block_result, blocked_by_guardrail, rewrite_args) in enumerate(parsed_calls)
                 if block_result is None
             ]
             futures = []
             if runnable_calls:
                 max_workers = min(len(runnable_calls), _MAX_TOOL_WORKERS)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    for i, tc, name, args in runnable_calls:
+                    for i, tc, name, args, pre_tool_rewrite_args in runnable_calls:
                         # Propagate ContextVars (e.g. _approval_session_key); mirrors asyncio.to_thread.
                         ctx = contextvars.copy_context()
-                        f = executor.submit(ctx.run, _run_tool, i, tc, name, args)
+                        f = executor.submit(ctx.run, _run_tool, i, tc, name, args, pre_tool_rewrite_args)
                         futures.append(f)
 
                     # Wait for all to complete with periodic heartbeats so the
@@ -10665,7 +10671,7 @@ class AIAgent:
                 spinner.stop(f"⚡ {completed}/{num_tools} tools completed in {total_dur:.1f}s total")
 
         # ── Post-execution: display per-tool results ─────────────────────
-        for i, (tc, name, args, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
+        for i, (tc, name, args, block_result, blocked_by_guardrail, rewrite_args) in enumerate(parsed_calls):
             r = results[i]
             blocked = False
             if r is None:

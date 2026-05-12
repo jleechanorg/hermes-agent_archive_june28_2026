@@ -705,6 +705,7 @@ def handle_function_call(
     user_task: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
     skip_pre_tool_call_hook: bool = False,
+    pre_tool_rewrite_args: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -751,6 +752,8 @@ def handle_function_call(
 
             if block_message is not None:
                 return json.dumps({"error": block_message}, ensure_ascii=False)
+        elif pre_tool_rewrite_args:
+            function_args = {**function_args, **pre_tool_rewrite_args}
 
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).

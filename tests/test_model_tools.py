@@ -227,6 +227,43 @@ class TestPreToolCallBlocking:
         assert "post_tool_call" in hook_calls
         assert "transform_tool_result" in hook_calls
 
+    def test_skip_flag_can_apply_pre_fired_rewrite_args(self, monkeypatch):
+        """When the caller already fired pre_tool_call, skip mode should still
+        allow the caller to pass the rewrite args through safely.
+        """
+        hook_calls = []
+
+        def fake_invoke_hook(hook_name, **kwargs):
+            hook_calls.append((hook_name, kwargs))
+            return []
+
+        captured = {}
+
+        def fake_dispatch(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return json.dumps({"ok": True})
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
+        monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
+
+        result = json.loads(
+            handle_function_call(
+                "web_search",
+                {"q": "original"},
+                task_id="t1",
+                skip_pre_tool_call_hook=True,
+                pre_tool_rewrite_args={"q": "rewritten"},
+            )
+        )
+
+        assert result == {"ok": True}
+        assert hook_calls == [
+            ("post_tool_call", ANY),
+            ("transform_tool_result", ANY),
+        ]
+        assert captured["args"][1]["q"] == "rewritten"
+
     def test_run_agent_pattern_fires_pre_tool_call_exactly_once(self, monkeypatch):
         """End-to-end regression for the double-fire bug.
 
