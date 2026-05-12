@@ -6,12 +6,8 @@ rather than leaving zombie processes or telling users to manually restart
 when launchd will auto-respawn.
 """
 
-import os as _os
 import subprocess
 from types import SimpleNamespace
-
-# Preserve real os.path.isdir before any monkeypatching overrides it
-os_path_isdir = _os.path.isdir
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -1072,17 +1068,14 @@ class TestFindGatewayPidsExclude:
 
     def test_excludes_specified_pids(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
-        monkeypatch.setattr(gateway_cli, "_get_service_pids", lambda: set())
-        # On Linux CI, /proc exists so find_gateway_pids reads /proc instead
-        # of calling subprocess.run. Force the ps path by mocking /proc check.
-        monkeypatch.setattr("os.path.isdir", lambda p: False if p == "/proc" else os_path_isdir(p))
+        monkeypatch.setattr(gateway_cli.os.path, "isdir", lambda path: False)
 
         def fake_run(cmd, **kwargs):
             return subprocess.CompletedProcess(
                 cmd, 0,
                 stdout=(
-                    "100 python gateway/run.py\n"
-                    "200 python gateway/run.py\n"
+                    "user  100  0.0  0.0  0  0  ?  S  00:00  0:00  python gateway/run.py\n"
+                    "user  200  0.0  0.0  0  0  ?  S  00:00  0:00  python gateway/run.py\n"
                 ),
                 stderr="",
             )
@@ -1096,15 +1089,14 @@ class TestFindGatewayPidsExclude:
 
     def test_no_exclude_returns_all(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
-        monkeypatch.setattr(gateway_cli, "_get_service_pids", lambda: set())
-        monkeypatch.setattr("os.path.isdir", lambda p: False if p == "/proc" else os_path_isdir(p))
+        monkeypatch.setattr(gateway_cli.os.path, "isdir", lambda path: False)
 
         def fake_run(cmd, **kwargs):
             return subprocess.CompletedProcess(
                 cmd, 0,
                 stdout=(
-                    "100 python gateway/run.py\n"
-                    "200 python gateway/run.py\n"
+                    "user  100  0.0  0.0  0  0  ?  S  00:00  0:00  python gateway/run.py\n"
+                    "user  200  0.0  0.0  0  0  ?  S  00:00  0:00  python gateway/run.py\n"
                 ),
                 stderr="",
             )
@@ -1120,8 +1112,8 @@ class TestFindGatewayPidsExclude:
         profile_dir = tmp_path / ".hermes" / "profiles" / "orcha"
         profile_dir.mkdir(parents=True)
         monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
+        monkeypatch.setattr(gateway_cli.os.path, "isdir", lambda path: False)
         monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: profile_dir)
-        monkeypatch.setattr("os.path.isdir", lambda p: False if p == "/proc" else os_path_isdir(p))
 
         def fake_run(cmd, **kwargs):
             return subprocess.CompletedProcess(
