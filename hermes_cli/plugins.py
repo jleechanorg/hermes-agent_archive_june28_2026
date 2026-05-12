@@ -1452,11 +1452,13 @@ def get_pre_tool_call_directives(
     """Fire ``pre_tool_call`` once and return (block_message, rewrite_args).
 
     Plugins may return one of two directives from their ``pre_tool_call``
-    callback (first matching directive of each type wins):
+    callback:
 
         {"action": "block",   "message": "Reason"}      -> block the call
         {"action": "rewrite", "args":    {new_args}}     -> rewrite args
 
+    The first block directive wins; rewrite directives are merged in hook
+    order so later plugins can intentionally override earlier keys.
     Both are checked in a single hook-fire to preserve the single-fire
     contract: ``pre_tool_call`` executes exactly once per tool execution.
     """
@@ -1470,7 +1472,7 @@ def get_pre_tool_call_directives(
     )
 
     block_message: Optional[str] = None
-    rewrite_args: Optional[Dict[str, Any]] = None
+    rewrite_args: Dict[str, Any] = {}
 
     for result in hook_results:
         if not isinstance(result, dict):
@@ -1480,12 +1482,12 @@ def get_pre_tool_call_directives(
             message = result.get("message")
             if isinstance(message, str) and message:
                 block_message = message
-        elif action == "rewrite" and rewrite_args is None:
+        elif action == "rewrite":
             new_args = result.get("args")
             if isinstance(new_args, dict):
-                rewrite_args = new_args
+                rewrite_args.update(new_args)
 
-    return block_message, rewrite_args
+    return block_message, (rewrite_args or None)
 
 
 def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
