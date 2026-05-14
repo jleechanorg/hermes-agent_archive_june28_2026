@@ -10282,11 +10282,11 @@ class AIAgent:
                 block_message, rewrite_args = get_pre_tool_call_directives(
                     function_name, copy.deepcopy(function_args), task_id=effective_task_id or "",
                 )
-                if rewrite_args:
+                if rewrite_args and isinstance(rewrite_args, dict) and isinstance(function_args, dict):
                     function_args = {**function_args, **rewrite_args}
             except Exception:
                 pass
-        elif pre_tool_rewrite_args:
+        elif pre_tool_rewrite_args and isinstance(pre_tool_rewrite_args, dict) and isinstance(function_args, dict):
             function_args = {**function_args, **pre_tool_rewrite_args}
         if block_message is not None:
             return json.dumps({"error": block_message}, ensure_ascii=False)
