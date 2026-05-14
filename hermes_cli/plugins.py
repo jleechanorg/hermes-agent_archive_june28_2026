@@ -1319,36 +1319,19 @@ def get_pre_tool_call_block_message(
     session_id: str = "",
     tool_call_id: str = "",
 ) -> Optional[str]:
-    """Check ``pre_tool_call`` hooks for a blocking directive.
+    """Deprecated: use ``get_pre_tool_call_directives`` instead.
 
-    Plugins that need to enforce policy (rate limiting, security
-    restrictions, approval workflows) can return::
-
-        {"action": "block", "message": "Reason the tool was blocked"}
-
-    from their ``pre_tool_call`` callback.  The first valid block
-    directive wins.  Invalid or irrelevant hook return values are
-    silently ignored so existing observer-only hooks are unaffected.
+    Returns only the block message; rewrite directives are discarded.
+    Kept for backward compatibility with external callers.
     """
-    hook_results = invoke_hook(
-        "pre_tool_call",
-        tool_name=tool_name,
-        args=args if isinstance(args, dict) else {},
+    block_msg, _ = get_pre_tool_call_directives(
+        tool_name,
+        args,
         task_id=task_id,
         session_id=session_id,
         tool_call_id=tool_call_id,
     )
-
-    for result in hook_results:
-        if not isinstance(result, dict):
-            continue
-        if result.get("action") != "block":
-            continue
-        message = result.get("message")
-        if isinstance(message, str) and message:
-            return message
-
-    return None
+    return block_msg
 
 
 def get_pre_tool_call_directives(

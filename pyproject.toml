@@ -192,7 +192,7 @@ include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "gateway", "gat
 [tool.uv.sources]
 # uv 0.11 cannot currently resolve mistralai from the simple index, while pip
 # publishing still requires the public version specifier in [project.optional-dependencies].
-mistralai = { url = "https://files.pythonhosted.org/packages/1b/48/2c5c4f853dec32a625c1a3d23809b80cf2e135c3441fe1764f72910dfea9/mistralai-2.4.5-py3-none-any.whl" }
+mistralai = { url = "https://files.pythonhosted.org/packages/1b/48/2c5c4f853dec32a625c1a3d23809b80cf2e135c3441fe1764f72910dfea9/mistralai-2.4.5-py3-none-any.whl", hash = "sha256:bf3b6550258ab16dec8547b90e9c18bebf9099f55b7fc25a884bf0bbeffced0f" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

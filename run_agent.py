@@ -10420,7 +10420,21 @@ class AIAgent:
             if not isinstance(function_args, dict):
                 function_args = {}
 
-            # Checkpoint for file-mutating tools
+            block_message = None
+            block_result = None
+            blocked_by_guardrail = False
+            rewrite_args = None
+            try:
+                from hermes_cli.plugins import get_pre_tool_call_directives
+                block_message, rewrite_args = get_pre_tool_call_directives(
+                    function_name, copy.deepcopy(function_args), task_id=effective_task_id or "",
+                )
+                if rewrite_args and isinstance(rewrite_args, dict):
+                    function_args = {**function_args, **rewrite_args}
+            except Exception:
+                pass
+
+            # Checkpoint after rewrites so safety checks see the final args.
             if function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
                 try:
                     file_path = function_args.get("path", "")
@@ -10441,20 +10455,6 @@ class AIAgent:
                         )
                 except Exception:
                     pass
-
-            block_message = None
-            block_result = None
-            blocked_by_guardrail = False
-            rewrite_args = None
-            try:
-                from hermes_cli.plugins import get_pre_tool_call_directives
-                block_message, rewrite_args = get_pre_tool_call_directives(
-                    function_name, copy.deepcopy(function_args), task_id=effective_task_id or "",
-                )
-                if rewrite_args:
-                    function_args = {**function_args, **rewrite_args}
-            except Exception:
-                pass
 
             if block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)
