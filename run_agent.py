@@ -2785,12 +2785,14 @@ class AIAgent:
             and getattr(self, "platform", "") == "cli"
         )
 
-    def _emit_status(self, message: str) -> None:
+    def _emit_status(self, message: str, *, gateway_visible: bool = True) -> None:
         """Emit a lifecycle status message to both CLI and gateway channels.
 
         CLI users see the message via ``_vprint(force=True)`` so it is always
-        visible regardless of verbose/quiet mode.  Gateway consumers receive
-        it through ``status_callback("lifecycle", ...)``.
+        visible regardless of verbose/quiet mode.  Status callbacks receive
+        lifecycle updates too.  When callers mark retry telemetry as not
+        gateway-visible, chat gateways can suppress it while non-chat
+        renderers such as the TUI still see the status update.
 
         This helper never raises — exceptions are swallowed so it cannot
         interrupt the retry/fallback logic.
@@ -2801,7 +2803,8 @@ class AIAgent:
             pass
         if self.status_callback:
             try:
-                self.status_callback("lifecycle", message)
+                event = "lifecycle" if gateway_visible else "lifecycle_hidden"
+                self.status_callback(event, message)
             except Exception:
                 logger.debug("status_callback error in _emit_status", exc_info=True)
 
@@ -14029,7 +14032,10 @@ class AIAgent:
                                     pass
                     wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                     if is_rate_limited:
-                        self._emit_status(f"⏱️ Rate limited. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries})...")
+                        self._emit_status(
+                            f"⏱️ Rate limited. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries})...",
+                            gateway_visible=False,
+                        )
                     else:
                         self._emit_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})...")
                     logger.warning(

@@ -659,7 +659,10 @@ class TestAuxiliaryPoolAwareness:
 
         with (
             patch("agent.auxiliary_client.load_pool", return_value=_Pool()),
-            patch("hermes_cli.models.get_nous_recommended_aux_model", return_value="google/gemini-3-flash-preview"),
+            patch(
+                "hermes_cli.models.get_nous_recommended_aux_model",
+                return_value="qwen/qwen3.6-plus",
+            ),
             patch("agent.auxiliary_client.OpenAI") as mock_openai,
         ):
             from agent.auxiliary_client import _try_nous
@@ -667,7 +670,7 @@ class TestAuxiliaryPoolAwareness:
             client, model = _try_nous()
 
         assert client is not None
-        assert model == "google/gemini-3-flash-preview"
+        assert model == "qwen/qwen3.6-plus"
         assert mock_openai.call_args.kwargs["api_key"] == "pooled-agent-key"
         assert mock_openai.call_args.kwargs["base_url"] == "https://inference.pool.example/v1"
 

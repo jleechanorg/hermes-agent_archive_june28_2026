@@ -1845,6 +1845,50 @@ class TestExecuteToolCalls:
         assert "API call failed" not in output
         assert "Rate limit reached" not in output
 
+    def test_run_conversation_does_not_send_rate_limit_retry_wait_to_gateway(self, agent):
+        class _RateLimitError(Exception):
+            status_code = 429
+
+            def __str__(self):
+                return "Error code: 429 - Rate limit exceeded."
+
+        responses = [_RateLimitError(), _mock_response(content="Recovered")]
+        callback_statuses = []
+        gateway_statuses = []
+
+        def _status_callback(event, message):
+            callback_statuses.append((event, message))
+            if event != "lifecycle_hidden":
+                gateway_statuses.append((event, message))
+
+        def _fake_api_call(api_kwargs):
+            result = responses.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        agent.status_callback = _status_callback
+        agent._interruptible_api_call = _fake_api_call
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+        agent._save_session_log = lambda *args, **kwargs: None
+
+        captured = io.StringIO()
+        agent._print_fn = lambda *args, **kw: print(*args, file=captured, **kw)
+
+        with patch("run_agent.time.sleep", return_value=None):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered"
+        assert "Rate limited. Waiting" in captured.getvalue()
+        assert any(
+            event == "lifecycle_hidden" and "Rate limited. Waiting" in message
+            for event, message in callback_statuses
+        )
+        assert gateway_statuses, "Expected regular lifecycle statuses to still reach gateway callback"
+        assert not any("Rate limited. Waiting" in message for _, message in gateway_statuses)
+
 
 class TestConcurrentToolExecution:
     """Tests for _execute_tool_calls_concurrent and dispatch logic."""

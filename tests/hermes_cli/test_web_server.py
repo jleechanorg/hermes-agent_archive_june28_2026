@@ -1857,9 +1857,9 @@ class TestPluginAPIAuth:
         """Plugin API routes should work with a valid session token.
 
         Use ``/api/plugins/kanban/board`` from the kanban plugin — a stable,
-        side-effect-free GET that auto-initialises its DB on first call. With
-        a valid token the handler should run (200); without one the middleware
-        should 401 before the handler is reached.
+        side-effect-free GET that's mounted in tests. With a valid token the
+        handler should run (200); without one the middleware should 401 before
+        the handler is reached.
         """
         # Without auth: middleware blocks before reaching the handler.
         resp = self.client.get("/api/plugins/kanban/board")
