@@ -1,0 +1,355 @@
+name: Skeptic Cron
+
+# Runs every 30 minutes — evaluates all open PRs and merges when 7-green.
+# 7-green: CI + no conflicts + CR approved + bugbot clean + comments resolved + evidence + skeptic verdict
+# Trivial: re-trigger CR scan to post fresh APPROVED review
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: skeptic-cron
+  cancel-in-progress: false
+
+jobs:
+  skeptic_cron:
+    name: Skeptic Cron
+    runs-on: ${{ fromJson(vars.SELF_HOSTED_RUNNER_LABELS || '["self-hosted","self-hosted-mikey"]') }}
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      checks: write
+    outputs:
+      merged_count: ${{ steps.merge_prs.outputs.merged_count }}
+    steps:
+
+      - name: List open PRs
+        id: list_prs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Include all non-draft PRs; flag same_repo for downstream handling.
+          # Null guard on head.repo: if null (deleted repo), skip to fail closed.
+          PR_JSON=$(gh api repos/${{ github.repository }}/pulls --paginate \
+            | jq '[.[] | select(.draft == false and .head.repo != null)
+              | {
+                  number,
+                  title,
+                  head: {ref: .head.ref, sha: .head.sha},
+                  base: {ref: .base.ref, id: .base.repo.id},
+                  same_repo: (.head.repo.id == .base.repo.id),
+                  mergeable
+                }
+            ]')
+
+          echo "Open non-draft PRs: $(echo "$PR_JSON" | jq 'length')"
+          echo "pr_numbers=$(echo "$PR_JSON" | jq -c '.')" >> "$GITHUB_OUTPUT"
+          echo "pr_count=$(echo "$PR_JSON" | jq 'length')" >> "$GITHUB_OUTPUT"
+
+      - name: Check 7-green and merge
+        id: merge_prs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_JSON: ${{ steps.list_prs.outputs.pr_numbers }}
+        run: |
+          MERGED=0
+
+          for PR in $(echo "$PR_JSON" | jq -r '.[] | @base64'); do
+            PR_DATA=$(echo "$PR" | base64 -d)
+            PR_NUM=$(echo "$PR_DATA" | jq -r '.number')
+            PR_TITLE=$(echo "$PR_DATA" | jq -r '.title')
+            SAME_REPO=$(echo "$PR_DATA" | jq -r '.same_repo')
+            CR_PASS="false"
+
+            echo ""
+            echo "--- Checking 7-green for PR #$PR_NUM: $PR_TITLE ---"
+            [[ "$SAME_REPO" != "true" ]] && echo "  [cross-repo PR — evaluating only, will not auto-merge]"
+
+            # Fetch PR head SHA once — used by CR_READY fallback (step 3) and BUGBOT_ERRORS (step 4).
+            # Null guard: if gh api fails, fail closed — do not merge with empty SHA.
+            PR_HEAD=$(gh api repos/${{ github.repository }}/pulls/"$PR_NUM" --jq '.head.sha' 2>/dev/null) || {
+              echo "  ERROR: gh api PR head failed — skipping"
+              continue
+            }
+            [ -z "$PR_HEAD" ] && {
+              echo "  ERROR: gh api returned empty SHA — skipping"
+              continue
+            }
+
+            # 1. CI green (using check runs API — covers GH Actions, status checks, and branch protection)
+            # Retry up to 3 times with 2s backoff to handle transient rate-limiting.
+            # gh api --paginate emits one JSON doc per page — use jq -rs to aggregate before evaluation.
+            # Stale in_progress checks from known-external apps (cursor[bot]) are treated as neutral.
+            # Exclude green-gate/skeptic-gate and staging-canary-gate to avoid self-referential blocking.
+            CI_STATUS=""
+            for _retry in 1 2 3; do
+              CI_RAW=$(gh api repos/${{ github.repository }}/commits/"$PR_HEAD"/check-runs --paginate 2>/dev/null)
+              if [ -n "$CI_RAW" ]; then
+                CI_STATUS=$(printf '%s\n' "$CI_RAW" | jq -rs \
+                  --arg now "$(date +%s)" '
+                  def stale_threshold: 900;
+                  def skip_stale: (.app.slug == "cursor" and .status == "in_progress" and (($now | tonumber) - (.started_at | fromdateiso8601) > stale_threshold));
+                  (map(.check_runs // []) | add) as $runs |
+                  ($runs | map(select(.name != "Green Gate" and .name != "Skeptic Gate" and .name != "Staging Canary Gate"))) as $external_runs |
+                  if ($external_runs | length) == 0 then "neutral"
+                  elif ($external_runs | map(select(.conclusion == null and .status == "in_progress" and (skip_stale | not))) | length) > 0 then "in_progress"
+                  elif ($external_runs | map(select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral" and .conclusion != "cancelled")) | length) > 0 then "failure"
+                  else "success"
+                  end' 2>/dev/null || echo "error")
+                break
+              fi
+              sleep 2
+            done
+            [ -z "$CI_STATUS" ] && CI_STATUS="error"
+            [[ "$CI_STATUS" == "success" ]] && echo "  [1] CI: PASS" || echo "  [1] CI: $CI_STATUS"
+
+            # 2. No conflicts
+            MERGEABLE=$(gh api repos/${{ github.repository }}/pulls/"$PR_NUM" --jq '.mergeable' 2>/dev/null || echo "unknown")
+            [[ "$MERGEABLE" == "true" ]] && echo "  [2] Conflicts: PASS" || echo "  [2] Conflicts: mergeable=$MERGEABLE"
+
+            # 3. CR approved (coderabbitai[bot])
+            #   A dismissed CHANGES_REQUESTED does NOT satisfy the CR gate — dismissed means
+            #   the issues were not addressed, just hidden. We require an APPROVED review that
+            #   came AFTER the most recent CHANGES_REQUESTED (or DISMISSED, which is a dismissed
+            #   CHANGES_REQUESTED). If CR posted CHANGES_REQUESTED then it was dismissed and
+            #   later re-approved, only the post-dismissal APPROVED counts.
+            #   Fallback: CR posted a verdict comment explicitly approving the PR
+            #   (covers CR incremental-review stalls where formal state=DISMISSED/COMMENTED but CR
+            #   has explicitly confirmed the PR is ready via inline verdict comment).
+            #   Recognized verdict patterns:
+            #     - "AUTOMATION COMPLETE.*READY FOR MERGE" (standard CR completion format)
+            #     - "FINAL VERDICT.*APPROVE" (CR FINAL VERDICT format used in this org)
+            #     - "Comments resolved and changes approved" (CR incremental-approval acknowledgment)
+            # Extract latest CHANGES_REQUESTED/DISMISSED and APPROVED timestamps from all CR reviews,
+            # then check APPROVED > latest blocker. --slurp flattens paginated pages.
+            # DISMISSED is a dismissed CHANGES_REQUESTED — always blocking (not resolved).
+            CR_APPROVED_AFTER_CHANGES=$(gh api repos/${{ github.repository }}/pulls/"$PR_NUM"/reviews --paginate --slurp \
+              | jq -r '[.[][] | select(.user.login == "coderabbitai[bot]")] |
+                (map(select(.state == "CHANGES_REQUESTED" or .state == "DISMISSED") | .submitted_at) | max // null) as $last_blocker |
+                (map(select(.state == "APPROVED") | .submitted_at) | max // null) as $last_approved |
+                if $last_approved == null then false
+                elif $last_blocker == null then true
+                else $last_approved > $last_blocker
+                end' \
+              2>/dev/null || echo "false")
+            CR_LAST_BLOCKER=$(gh api repos/${{ github.repository }}/pulls/"$PR_NUM"/reviews --paginate --slurp \
+              | jq -r '[.[][] | select(.user.login == "coderabbitai[bot]" and (.state == "CHANGES_REQUESTED" or .state == "DISMISSED")) | .submitted_at] | max // ""' \
+              2>/dev/null || echo "")
+            if [[ "$CR_APPROVED_AFTER_CHANGES" == "true" ]]; then
+              echo "  [3] CR: PASS (APPROVED after CHANGES_REQUESTED)"
+              CR_PASS="true"
+            else
+              # Fallback: CR posted a verdict comment explicitly approving the PR
+              # Note: CR verdict comments are on the issue, not the PR review thread.
+              # --slurp: flatten all pages into single array so jq sees all results at once.
+              # Only comments newer than the latest blocking CR review count; older
+              # verdict comments are stale and must not override a newer blocker.
+              CR_READY=$(gh api repos/${{ github.repository }}/issues/"$PR_NUM"/comments --paginate --slurp 2>/dev/null \
+                | jq -r --arg last_blocker "$CR_LAST_BLOCKER" '[.[][] | select(
+                  .user.login == "coderabbitai[bot]"
+                  and (.body | test("AUTOMATION COMPLETE.*READY FOR MERGE|FINAL VERDICT.*APPROVE|Comments resolved and changes approved"; "i"))
+                  and ($last_blocker == "" or .created_at > $last_blocker)
+                )] | length' 2>/dev/null || echo "0")
+              if [[ "$CR_READY" != "0" ]]; then
+                echo "  [3] CR: PASS (verdict comment — CR incremental stall fallback)"
+                CR_PASS="true"
+              else
+                echo "  [3] CR: FAIL (no APPROVED after latest CHANGES_REQUESTED)"
+              fi
+            fi
+
+            # PR_HEAD (fetched at top of loop) is used by both Gate 4 (bugbot) and Gate 7 (skeptic).
+
+            # 4. Bugbot clean (cursor[bot]) — fail-closed: any API error blocks the gate.
+            # Filter: only count cursor[bot] comments with HIGH or CRITICAL severity labels.
+            # Low/Medium/nit findings don't block merge (they are advisory).
+            # Using severity label detection rather than word-matching "error" to avoid
+            # false positives from "error" appearing in HTML entities, URLs, or advisory comments.
+            # Stale comments: only count cursor[bot] HIGH/CRITICAL comments whose original_commit_id
+            # matches the current PR head SHA (or is null, for comments predating the commit tracking
+            # feature). Bugbot posts new comments on new code; old comments become "outdated".
+            # PR_HEAD is set at the top of the loop (before step 1). --slurp wraps all pages.
+            BUGBOT_ERRORS=$(gh api repos/${{ github.repository }}/pulls/"$PR_NUM"/comments --paginate --slurp \
+              | jq --arg pr_head "$PR_HEAD" -r \
+              '[.[][] | select(.user.login == "cursor[bot]" and (.body | test("HIGH SEVERITY|CRITICAL SEVERITY"; "i"))) | select(.original_commit_id == $pr_head or (.original_commit_id | type) == "null") | .id] | length' 2>/dev/null || echo "-1")
+            [[ "$BUGBOT_ERRORS" == "0" ]] && echo "  [4] Bugbot: PASS" || echo "  [4] Bugbot: $BUGBOT_ERRORS errors"
+
+            # 5. Comments resolved (non-nit) — fail-closed: any API error blocks the gate.
+            # REST comments endpoint does not expose thread resolution state, so this gate
+            # approximates: top-level review comments that are not nit-picks.
+            # Pass Gate 5 when CR has approved — CR's APPROVED verdict supersedes the
+            # unresolved non-nit comment count (CR has already reviewed and approved the PR).
+            # API errors (UNRESOLVED == -1) always fail — never bypassed by CR_PASS.
+            UNRESOLVED=$(gh api repos/${{ github.repository }}/pulls/"$PR_NUM"/comments --paginate \
+              | jq -r '[.[] | select(.in_reply_to_id == null) | select(.body | test("^(nit:|nitpick)"; "i") | not)] | length' 2>/dev/null || echo "-1")
+            if [[ "$UNRESOLVED" == "-1" ]]; then
+              echo "  [5] Comments: ERROR (API fetch failed)"
+              GATE5_FAIL="true"
+            elif [[ "$UNRESOLVED" == "0" ]]; then
+              echo "  [5] Comments: PASS"
+              GATE5_FAIL="false"
+            elif [[ "$CR_PASS" == "true" ]]; then
+              echo "  [5] Comments: N/A (CR APPROVED — nits excluded from unresolved count)"
+              GATE5_FAIL="false"
+            else
+              echo "  [5] Comments: $UNRESOLVED unresolved"
+              GATE5_FAIL="true"
+            fi
+
+            # 6. Evidence (evidence-review-bot) — optional: only block on explicit FAIL state.
+            # evidence-review-bot only produces APPROVED or DISMISSED/CHANGES_REQUESTED review
+            # states. Anything else (none, COMMENTED, PENDING) means it has not run yet = N/A.
+            EVIDENCE=$(gh api repos/${{ github.repository }}/pulls/"$PR_NUM"/reviews --paginate \
+              | jq -r '[.[] | select(.user.login == "evidence-review-bot")] | sort_by(.submitted_at) | reverse | .[0].state // "none"' 2>/dev/null || echo "none")
+            if [[ "$EVIDENCE" == "APPROVED" ]]; then
+              echo "  [6] Evidence: PASS"
+            elif [[ "$EVIDENCE" == "DISMISSED" || "$EVIDENCE" == "CHANGES_REQUESTED" ]]; then
+              echo "  [6] Evidence: FAIL ($EVIDENCE)"
+            else
+              echo "  [6] Evidence: N/A ($EVIDENCE)"
+            fi
+
+            # 7. Skeptic verdict (github-actions[bot] VERDICT comment) — pick LATEST, not oldest
+            # MISSING/SKEPTIC_NO_VERDICT means skeptic-cron is automated skeptic; it evaluates and posts.
+            # SKIPPED means ANTHROPIC_API_KEY not configured — do NOT auto-merge (gate not functional).
+            # SHA verification: skeptic-gate includes the HEAD-SHA in its comment (e.g. "ran on commit `abc1234`").
+            # If the verdict SHA doesn't match the current PR head SHA, treat as stale MISSING.
+            # PR_HEAD is fetched at the top of the loop (line ~57) and used by Gates 4, 5, and 7.
+            # Capture verdict data separately from the gh api exit status so we can
+            # fail closed on API errors while still distinguishing empty-result from crash.
+            # --slurp: flatten all pages into single array so jq sees all results at once.
+            # Do not pipe gh into jq in one subshell — $? would reflect jq only, not gh.
+            SKEPTIC_VERDICT=""
+            SKEPTIC_SHA_MISMATCH=""
+            SKEPTIC_COMMENTS_JSON=""
+            if ! SKEPTIC_COMMENTS_JSON=$(gh api repos/${{ github.repository }}/issues/"$PR_NUM"/comments --paginate --slurp 2>/dev/null); then
+              SKEPTIC_VERDICT="SKEPTIC_ERROR"
+            else
+              SKEPTIC_COMMENT_JSON=$(printf '%s\n' "$SKEPTIC_COMMENTS_JSON" | jq -c '[.[][] | select(.user.login == "github-actions[bot]" and (.body | test("VERDICT:"; "i")))] | sort_by(.created_at) | reverse | .[0] // null' 2>/dev/null)
+              JQ_STAT=$?
+              if [ "$JQ_STAT" -ne 0 ]; then
+                SKEPTIC_VERDICT="SKEPTIC_ERROR"
+              elif [ -z "$SKEPTIC_COMMENT_JSON" ] || [ "$SKEPTIC_COMMENT_JSON" = "null" ]; then
+                # No verdict comment found — MISSING (skeptic-cron may auto-post).
+                SKEPTIC_VERDICT="SKEPTIC_NO_VERDICT"
+                SKEPTIC_SHA_MISMATCH=""
+              else
+                # Parse body once: canonical verdict token + HEAD-SHA (no re-grep of full body downstream).
+                PARSED=$(printf '%s\n' "$SKEPTIC_COMMENT_JSON" | jq -r '
+                  .body as $b |
+                  (if ($b | test("<!--[[:space:]]*HEAD-SHA:")) then ($b | capture("<!--[[:space:]]*HEAD-SHA:[[:space:]]*(?<sha>[a-f0-9]+)")).sha else "" end) as $sha |
+                  (if ($b | test("VERDICT:[[:space:]]*FAIL"; "i")) then "FAIL"
+                   elif ($b | test("VERDICT:[[:space:]]*PASS"; "i")) then "PASS"
+                   elif ($b | test("VERDICT:[[:space:]]*SKIPPED"; "i")) then "SKIPPED"
+                   elif ($b | test("VERDICT:[[:space:]]*ERROR"; "i")) then "ERROR"
+                   else "UNPARSED"
+                   end) as $tok |
+                  [$tok, $sha] | @tsv
+                ' 2>/dev/null || printf '\t')
+                SKEPTIC_VERDICT=$(printf '%s\n' "$PARSED" | cut -f1)
+                VERDICT_SHA=$(printf '%s\n' "$PARSED" | cut -f2)
+                if [ -n "$VERDICT_SHA" ] && [ "$VERDICT_SHA" != "$PR_HEAD" ]; then
+                  echo "  [7] Skeptic: STALE (verdict SHA \`${VERDICT_SHA:0:7}\`, PR head \`${PR_HEAD:0:7}\` — treating as MISSING)"
+                  SKEPTIC_VERDICT="SKEPTIC_NO_VERDICT"
+                  SKEPTIC_SHA_MISMATCH="true"
+                else
+                  SKEPTIC_SHA_MISMATCH=""
+                fi
+              fi
+            fi
+            if [ "$SKEPTIC_VERDICT" = "PASS" ]; then
+              echo "  [7] Skeptic: PASS"
+            elif [ "$SKEPTIC_VERDICT" = "FAIL" ]; then
+              echo "  [7] Skeptic: FAIL"
+            elif [ "$SKEPTIC_VERDICT" = "SKIPPED" ]; then
+              echo "  [7] Skeptic: SKIPPED (ANTHROPIC_API_KEY not configured — gate not functional)"
+            elif [ "$SKEPTIC_VERDICT" = "SKEPTIC_ERROR" ]; then
+              echo "  [7] Skeptic: ERROR (API fetch failed — fail-closed, will skip)"
+            elif [ "$SKEPTIC_VERDICT" = "UNPARSED" ]; then
+              echo "  [7] Skeptic: UNPARSED (no recognizable VERDICT token in comment body)"
+            elif [ "$SKEPTIC_VERDICT" = "ERROR" ]; then
+              echo "  [7] Skeptic: ERROR (VERDICT: ERROR in comment)"
+            else
+              echo "  [7] Skeptic: MISSING (skeptic-cron is automated skeptic — will post)"
+            fi
+
+            # Skip if criteria 1-6 fail
+            # Gate 5: UNRESOLVED=-1 always fails (API error); UNRESOLVED>0 only blocks when CR not approved
+            # Gate 6: EVIDENCE only blocks on explicit FAIL (DISMISSED/CHANGES_REQUESTED); N/A = pass
+            GATE6_FAIL=$([[ "$EVIDENCE" == "DISMISSED" || "$EVIDENCE" == "CHANGES_REQUESTED" ]] && echo "true" || echo "false")
+            if [[ "$CI_STATUS" != "success" || "$MERGEABLE" != "true" || "$CR_PASS" != "true" || "$BUGBOT_ERRORS" != "0" || "$GATE5_FAIL" == "true" || "$GATE6_FAIL" == "true" ]]; then
+              echo "  → Not 7-green ready, skipping"
+              continue
+            fi
+            # Criterion 7: FAIL/SKIPPED/ERROR blocks; PASS permits; MISSING = auto-post
+            # Fixes CR actionable: only auto-post PASS when skeptic-gate did not run (no VERDICT comment).
+            # The old `else` branch was lossy — it auto-posted PASS for UNKNOWN or any unparseable output,
+            # creating a false VERDICT: PASS that bypassed the skeptic gate entirely.
+            if echo "$SKEPTIC_SHA_MISMATCH" | grep -q "true"; then
+              echo "  → Skeptic verdict SHA mismatch (stale), skipping"
+              continue
+            fi
+            if [ "$SKEPTIC_VERDICT" = "FAIL" ] || [ "$SKEPTIC_VERDICT" = "ERROR" ] || [ "$SKEPTIC_VERDICT" = "UNPARSED" ]; then
+              echo "  → Skeptic verdict is $SKEPTIC_VERDICT, skipping"
+              continue
+            fi
+            if [ "$SKEPTIC_VERDICT" = "SKEPTIC_ERROR" ]; then
+              echo "  → Skeptic verdict fetch failed, skipping (fail-closed)"
+              continue
+            fi
+            if [ "$SKEPTIC_VERDICT" = "PASS" ]; then
+              echo "  → Skeptic VERDICT: PASS confirmed"
+            elif [ "$SKEPTIC_VERDICT" = "SKEPTIC_NO_VERDICT" ]; then
+              # No VERDICT comment found — skeptic-gate either skipped or failed to post.
+              # UNKNOWN/ERROR exits with non-zero in the gate, so CI fails first.
+              # Only auto-post when there is genuinely no verdict (MISSING = skeptic-cron is the skeptic).
+              echo "  → Posting VERDICT: PASS (skeptic-cron is automated skeptic)"
+              gh api repos/${{ github.repository }}/issues/"$PR_NUM"/comments \
+                --method POST \
+                --field "body=**VERDICT: PASS** — skeptic-cron evaluated and merged this PR. All 6 criteria confirmed green.  \n\n<!-- HEAD-SHA: $PR_HEAD -->" \
+                --jq '.id' > /dev/null 2>&1 || true
+            elif [ "$SKEPTIC_VERDICT" = "SKIPPED" ]; then
+              # ANTHROPIC_API_KEY not configured — skeptic-gate cannot run.
+              # SKIPPED means the skeptic gate did not function, so keep this
+              # PR blocked instead of converting the missing verdict to PASS.
+              echo "  → Posting VERDICT: SKIPPED (skeptic-gate not functional)"
+              gh api repos/${{ github.repository }}/issues/"$PR_NUM"/comments \
+                --method POST \
+                --field "body=**VERDICT: SKIPPED** — skeptic-gate SKIPPED (ANTHROPIC_API_KEY not configured); auto-merge remains blocked.  \n\n<!-- HEAD-SHA: $PR_HEAD -->" \
+                --jq '.id' > /dev/null 2>&1 || true
+              continue
+            else
+              echo "  → Skeptic verdict unrecognized, skipping (fail-closed)"
+              continue
+            fi
+
+            # Only auto-merge same-repo PRs; cross-repo PRs get evaluated but not merged by this cron.
+            if [[ "$SAME_REPO" != "true" ]]; then
+              echo "  → Cross-repo PR — evaluated (7-green: criteria 1-7 OK) but auto-merge skipped by skeptic-cron"
+              continue
+            fi
+
+            echo ""
+            echo "*** PR #$PR_NUM is 7-green! Merging... ***"
+            MERGE_RESULT=$(gh pr merge "$PR_NUM" --squash --auto --delete-branch --repo ${{ github.repository }} 2>&1 || echo "MERGE_FAILED")
+            if echo "$MERGE_RESULT" | grep -qi "MERGE_FAILED\|error"; then
+              echo "Merge failed: $MERGE_RESULT"
+            else
+              echo "Successfully merged PR #$PR_NUM"
+              MERGED=$((MERGED + 1))
+            fi
+          done
+
+          echo "merged_count=$MERGED" >> "$GITHUB_OUTPUT"
+          echo ""
+          echo "=== Skeptic cron complete: $MERGED PR(s) merged ==="
+
+      - name: Report merge results
+        if: steps.merge_prs.outputs.merged_count != '0'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Skeptic cron merged ${{ steps.merge_prs.outputs.merged_count }} PR(s)"
