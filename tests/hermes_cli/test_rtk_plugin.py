@@ -40,10 +40,11 @@ def _make_plugin_dir(base: Path, name: str, *, register_body: str = "pass",
 class TestRTKPlugin:
     """Tests for the RTK rewrite plugin itself."""
 
-    def test_rtk_rewrite_returns_modified_command(self):
+    def test_rtk_rewrite_returns_modified_command(self, monkeypatch):
         """RTK plugin hook callback returns rewrite directive with rewritten command."""
         from hermes_plugins.rtk import _rewrite_terminal_command
 
+        monkeypatch.delenv("HERMES_RTK_DISABLE", raising=False)
         with patch("shutil.which", return_value="/usr/bin/rtk"), \
              patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(
@@ -112,11 +113,12 @@ class TestRTKPlugin:
             )
         assert result is None
 
-    def test_rtk_rewrite_preserves_command_on_no_change(self):
+    def test_rtk_rewrite_preserves_command_on_no_change(self, monkeypatch):
         """If rtk rewrite returns the same command, plugin still returns the rewrite
         directive (the prefix 'rtk' is the savings mechanism)."""
         from hermes_plugins.rtk import _rewrite_terminal_command
 
+        monkeypatch.delenv("HERMES_RTK_DISABLE", raising=False)
         with patch("shutil.which", return_value="/usr/bin/rtk"), \
              patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(
