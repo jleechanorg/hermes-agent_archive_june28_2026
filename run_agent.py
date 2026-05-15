@@ -120,6 +120,7 @@ else:
 
 # Import our tool system
 from model_tools import (
+    coerce_tool_args,
     get_tool_definitions,
     get_toolset_for_tool,
     handle_function_call,
@@ -10282,12 +10283,14 @@ class AIAgent:
                 block_message, rewrite_args = get_pre_tool_call_directives(
                     function_name, copy.deepcopy(function_args), task_id=effective_task_id or "",
                 )
-                if rewrite_args and isinstance(rewrite_args, dict) and isinstance(function_args, dict):
+                if rewrite_args:
                     function_args = {**function_args, **rewrite_args}
+                    function_args = coerce_tool_args(function_name, function_args)
             except Exception:
                 pass
-        elif pre_tool_rewrite_args and isinstance(pre_tool_rewrite_args, dict) and isinstance(function_args, dict):
+        elif pre_tool_rewrite_args:
             function_args = {**function_args, **pre_tool_rewrite_args}
+            function_args = coerce_tool_args(function_name, function_args)
         if block_message is not None:
             return json.dumps({"error": block_message}, ensure_ascii=False)
 
@@ -10420,21 +10423,7 @@ class AIAgent:
             if not isinstance(function_args, dict):
                 function_args = {}
 
-            block_message = None
-            block_result = None
-            blocked_by_guardrail = False
-            rewrite_args = None
-            try:
-                from hermes_cli.plugins import get_pre_tool_call_directives
-                block_message, rewrite_args = get_pre_tool_call_directives(
-                    function_name, copy.deepcopy(function_args), task_id=effective_task_id or "",
-                )
-                if rewrite_args and isinstance(rewrite_args, dict):
-                    function_args = {**function_args, **rewrite_args}
-            except Exception:
-                pass
-
-            # Checkpoint after rewrites so safety checks see the final args.
+            # Checkpoint for file-mutating tools
             if function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
                 try:
                     file_path = function_args.get("path", "")
@@ -10456,6 +10445,21 @@ class AIAgent:
                 except Exception:
                     pass
 
+            block_message = None
+            block_result = None
+            blocked_by_guardrail = False
+            rewrite_args = None
+            try:
+                from hermes_cli.plugins import get_pre_tool_call_directives
+                block_message, rewrite_args = get_pre_tool_call_directives(
+                    function_name, copy.deepcopy(function_args), task_id=effective_task_id or "",
+                )
+                if rewrite_args:
+                    function_args = {**function_args, **rewrite_args}
+                    function_args = coerce_tool_args(function_name, function_args)
+            except Exception:
+                pass
+
             if block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)
             else:
@@ -10465,6 +10469,25 @@ class AIAgent:
                     blocked_by_guardrail = True
 
             parsed_calls.append((tool_call, function_name, function_args, block_result, blocked_by_guardrail, None))
+
+        # Post-rewrite path conflict check: a pre_tool_call plugin may have
+        # rewritten a `path` arg so two formerly-independent path-scoped calls
+        # now target the same file.  _should_parallelize_tool_batch() used the
+        # original args and couldn't detect this.  Serialize the batch if any
+        # conflict is found.
+        _post_rewrite_paths: list = []
+        _post_rewrite_safe = True
+        for _, _fn, _fa, _br, _, _ in parsed_calls:
+            if _br is not None or _fn not in _PATH_SCOPED_TOOLS:
+                continue
+            _sp = _extract_parallel_scope_path(_fn, _fa)
+            if _sp is None or any(_paths_overlap(_sp, _p) for _p in _post_rewrite_paths):
+                _post_rewrite_safe = False
+                logger.warning(
+                    "pre_tool_call rewrite created path conflict; serializing concurrent batch"
+                )
+                break
+            _post_rewrite_paths.append(_sp)
 
         # ── Logging / callbacks ──────────────────────────────────────────
         tool_names_str = ", ".join(name for _, name, _, _, _, _ in parsed_calls)
@@ -10609,7 +10632,7 @@ class AIAgent:
             ]
             futures = []
             if runnable_calls:
-                max_workers = min(len(runnable_calls), _MAX_TOOL_WORKERS)
+                max_workers = 1 if not _post_rewrite_safe else min(len(runnable_calls), _MAX_TOOL_WORKERS)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                     for i, tc, name, args, pre_tool_rewrite_args in runnable_calls:
                         # Propagate ContextVars (e.g. _approval_session_key); mirrors asyncio.to_thread.
@@ -10827,6 +10850,7 @@ class AIAgent:
                 )
                 if rewrite_args:
                     function_args = {**function_args, **rewrite_args}
+                    function_args = coerce_tool_args(function_name, function_args)
             except Exception:
                 pass
 

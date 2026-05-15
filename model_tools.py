@@ -746,15 +746,17 @@ def handle_function_call(
                     session_id=session_id or "",
                     tool_call_id=tool_call_id or "",
                 )
-                if rewrite_args and isinstance(rewrite_args, dict) and isinstance(function_args, dict):
+                if rewrite_args:
                     function_args = {**function_args, **rewrite_args}
+                    function_args = coerce_tool_args(function_name, function_args)
             except Exception as _hook_err:
                 logger.debug("pre_tool_call hook error: %s", _hook_err)
 
             if block_message is not None:
                 return json.dumps({"error": block_message}, ensure_ascii=False)
-        elif pre_tool_rewrite_args and isinstance(pre_tool_rewrite_args, dict) and isinstance(function_args, dict):
+        elif pre_tool_rewrite_args:
             function_args = {**function_args, **pre_tool_rewrite_args}
+            function_args = coerce_tool_args(function_name, function_args)
 
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).

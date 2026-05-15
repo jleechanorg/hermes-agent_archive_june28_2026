@@ -7,9 +7,10 @@ import pytest
 from hermes_cli.plugins import get_pre_tool_call_directives
 
 
-def _make_invoke(results):
+def _make_invoke(results, expected_hook_name="pre_tool_call"):
     """Return a mock invoke_hook that yields *results*."""
     def _invoke(hook_name, **kwargs):
+        assert hook_name == expected_hook_name
         return results
     return _invoke
 

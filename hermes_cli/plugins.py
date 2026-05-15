@@ -1318,20 +1318,80 @@ def get_pre_tool_call_block_message(
     task_id: str = "",
     session_id: str = "",
     tool_call_id: str = "",
-) -> Optional[str]:
-    """Deprecated: use ``get_pre_tool_call_directives`` instead.
+) -> tuple[Optional[str], List[Any]]:
+    """Check ``pre_tool_call`` hooks for a blocking directive.
 
-    Returns only the block message; rewrite directives are discarded.
-    Kept for backward compatibility with external callers.
+    Plugins that need to enforce policy (rate limiting, security
+    restrictions, approval workflows) can return::
+
+        {"action": "block", "message": "Reason the tool was blocked"}
+
+    from their ``pre_tool_call`` callback.  The first valid block
+    directive wins.  Invalid or irrelevant hook return values are
+    silently ignored so existing observer-only hooks are unaffected.
+
+    Returns:
+        A tuple ``(block_message, hook_results)`` where *block_message*
+        is ``None`` when no block directive was found, and *hook_results*
+        is the full list of non-None return values from all callbacks.
+        Callers can pass *hook_results* to
+        :func:`get_pre_tool_call_arg_overrides` to extract rewrite
+        directives without firing the hook a second time.
     """
-    block_msg, _ = get_pre_tool_call_directives(
-        tool_name,
-        args,
+    hook_results = invoke_hook(
+        "pre_tool_call",
+        tool_name=tool_name,
+        args=args if isinstance(args, dict) else {},
         task_id=task_id,
         session_id=session_id,
         tool_call_id=tool_call_id,
     )
-    return block_msg
+
+    for result in hook_results:
+        if not isinstance(result, dict):
+            continue
+        if result.get("action") != "block":
+            continue
+        message = result.get("message")
+        if isinstance(message, str) and message:
+            return message, hook_results
+
+    return None, hook_results
+
+
+def get_pre_tool_call_arg_overrides(
+    hook_results: List[Any],
+) -> Dict[str, Any]:
+    """Extract arg overrides from pre_tool_call hook results.
+
+    Plugins that need to rewrite tool arguments (e.g. RTK command rewriting)
+    return::
+
+        {"action": "rewrite", "args": {"command": "rtk git status"}}
+
+    from their ``pre_tool_call`` callback.  All rewrite directives are
+    merged (last-wins for duplicate keys).  Block directives and other
+    return values are ignored.
+
+    Args:
+        hook_results: The list returned by :func:`invoke_hook` or the
+            second element of :func:`get_pre_tool_call_block_message`'s
+            return tuple.
+
+    Returns:
+        A dict of merged arg overrides (empty when no rewrite directives
+        were found).
+    """
+    overrides: Dict[str, Any] = {}
+    for result in hook_results:
+        if not isinstance(result, dict):
+            continue
+        if result.get("action") != "rewrite":
+            continue
+        args = result.get("args")
+        if isinstance(args, dict):
+            overrides.update(args)
+    return overrides
 
 
 def get_pre_tool_call_directives(
