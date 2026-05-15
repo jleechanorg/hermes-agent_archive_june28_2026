@@ -1,0 +1,470 @@
+name: Green Gate
+
+# Deterministic 6-green check. No polling, no LLM evaluation.
+# Checks gates 1-6 and posts a result comment on every run.
+# Exit PASS when all gates pass, FAIL when any gate fails (Gate 6 is advisory).
+on:
+  pull_request:
+    types: [opened, synchronize, edited, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number"
+        required: true
+        type: string
+      head_sha:
+        description: "PR head commit SHA"
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false  # Never cancel in-progress gate runs; multiple runs for same SHA are harmless
+
+jobs:
+  green_gate:
+    name: Green Gate
+    runs-on: ${{ fromJson(vars.SELF_HOSTED_RUNNER_LABELS || '["self-hosted","self-hosted-mikey"]') }}
+    permissions:
+      pull-requests: write
+      issues: write
+      contents: read
+      checks: write
+    steps:
+      - name: Run 6-green gate checks
+        id: gates
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUM: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.inputs.head_sha || github.event.pull_request.head.sha }}
+        run: |
+          set +e
+          FAILED_GATES=""
+          GATE_ROWS=""
+
+          # Resolve HEAD_SHA if not provided (workflow_dispatch may have stale value)
+          if [ -z "$HEAD_SHA" ]; then
+            HEAD_SHA=$(gh api repos/${{ github.repository }}/pulls/"$PR_NUM" --jq '.head.sha' 2>/dev/null || echo "")
+          fi
+          if [ -z "$HEAD_SHA" ]; then
+            echo "ERROR: could not determine HEAD SHA for PR #$PR_NUM"
+            exit 1
+          fi
+          echo "Checking PR #$PR_NUM at SHA ${HEAD_SHA:0:12}"
+
+          # ----------------------------------------------------------------
+          # Gate 1: CI green — all non-gate check runs must pass.
+          #
+          # Strategy: check-runs API is authoritative (real-time per-job state).
+          # Exclude self-referential gate checks ("Green Gate", "Skeptic Gate",
+          # "Staging Canary Gate") to avoid blocking on our own workflow runs.
+          # All other check-runs must complete with success/skipped/neutral/cancelled.
+          # Stale in_progress checks from cursor[bot] (>15 min) are treated as neutral.
+          # Wait for CI to register (up to 15 min) before evaluating. This
+          # prevents false FAIL when the workflow fires before CI has even
+          # registered its check-runs.
+          # ----------------------------------------------------------------
+
+          echo "Waiting for CI check runs to register and complete..."
+          MAX_WAIT=900
+          INTERVAL=30
+          ELAPSED=0
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            # Brief settle delay before first check — GitHub can take ~5s to
+            # register all check-runs after a workflow completes.
+            if [ $ELAPSED -eq 0 ]; then
+              sleep 10
+              ELAPSED=10
+            else
+              sleep $INTERVAL
+              ELAPSED=$((ELAPSED + INTERVAL))
+            fi
+
+            GATE1_RAW=$(gh api repos/${{ github.repository }}/commits/"$HEAD_SHA"/check-runs \
+              --paginate 2>/dev/null)
+            if [ -n "$GATE1_RAW" ]; then
+              CHECK_RUNS_FAILED=$(printf '%s\n' "$GATE1_RAW" | jq -rs \
+                --arg now "$(date +%s)" '
+                def stale_threshold: 900;
+                def skip_stale: (.app.slug == "cursor" and .status == "in_progress" and (($now | tonumber) - (.started_at | fromdateiso8601) > stale_threshold));
+                (map(.check_runs // []) | add) as $runs |
+                ($runs | map(select(.name != "Green Gate" and .name != "Skeptic Gate" and .name != "Staging Canary Gate"))) as $external |
+                [ $external[] | select(.conclusion != null and .conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral" and .conclusion != "cancelled") ] | length' 2>/dev/null || echo "__API_ERROR__")
+              CHECK_RUNS_PENDING=$(printf '%s\n' "$GATE1_RAW" | jq -rs \
+                --arg now "$(date +%s)" '
+                def stale_threshold: 900;
+                def skip_stale: (.app.slug == "cursor" and .status == "in_progress" and (($now | tonumber) - (.started_at | fromdateiso8601) > stale_threshold));
+                (map(.check_runs // []) | add) as $runs |
+                ($runs | map(select(.name != "Green Gate" and .name != "Skeptic Gate" and .name != "Staging Canary Gate"))) as $external |
+                [ $external[] | select(.conclusion == null and .status == "in_progress" and (skip_stale | not)) ] | length' 2>/dev/null || echo "__API_ERROR__")
+              TOTAL_EXTERNAL=$(printf '%s\n' "$GATE1_RAW" | jq -rs \
+                '(map(.check_runs // []) | add) | map(select(.name != "Green Gate" and .name != "Skeptic Gate" and .name != "Staging Canary Gate")) | length' 2>/dev/null || echo "0")
+            else
+              CHECK_RUNS_FAILED="__API_ERROR__"
+              CHECK_RUNS_PENDING="__API_ERROR__"
+              TOTAL_EXTERNAL="0"
+            fi
+
+            echo "  [${ELAPSED}s] external=${TOTAL_EXTERNAL}, pending=${CHECK_RUNS_PENDING}, failed=${CHECK_RUNS_FAILED}"
+
+            # Done waiting when: no pending external runs (and no API errors)
+            if [ "$CHECK_RUNS_PENDING" != "__API_ERROR__" ] && [ "${CHECK_RUNS_PENDING:-0}" -eq 0 ]; then
+              echo "External CI checks completed after ${ELAPSED}s"
+              break
+            fi
+          done
+
+          if [ $ELAPSED -ge $MAX_WAIT ]; then
+            echo "TIMEOUT: CI checks not completed after ${MAX_WAIT}s"
+          fi
+
+          # Final state after wait
+          GATE1_FINAL=$(gh api repos/${{ github.repository }}/commits/"$HEAD_SHA"/check-runs \
+            --paginate 2>/dev/null)
+          if [ -n "$GATE1_FINAL" ]; then
+            CHECK_RUNS_FAILED=$(printf '%s\n' "$GATE1_FINAL" | jq -rs \
+              --arg now "$(date +%s)" '
+              def stale_threshold: 900;
+              def skip_stale: (.app.slug == "cursor" and .status == "in_progress" and (($now | tonumber) - (.started_at | fromdateiso8601) > stale_threshold));
+              (map(.check_runs // []) | add) as $runs |
+              ($runs | map(select(.name != "Green Gate" and .name != "Skeptic Gate" and .name != "Staging Canary Gate"))) as $external |
+              [ $external[] | select(.conclusion != null and .conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral" and .conclusion != "cancelled") ] | length' 2>/dev/null || echo "__API_ERROR__")
+            CHECK_RUNS_PENDING=$(printf '%s\n' "$GATE1_FINAL" | jq -rs \
+              --arg now "$(date +%s)" '
+              def stale_threshold: 900;
+              def skip_stale: (.app.slug == "cursor" and .status == "in_progress" and (($now | tonumber) - (.started_at | fromdateiso8601) > stale_threshold));
+              (map(.check_runs // []) | add) as $runs |
+              ($runs | map(select(.name != "Green Gate" and .name != "Skeptic Gate" and .name != "Staging Canary Gate"))) as $external |
+              [ $external[] | select(.conclusion == null and .status == "in_progress" and (skip_stale | not)) ] | length' 2>/dev/null || echo "__API_ERROR__")
+            TOTAL_EXTERNAL=$(printf '%s\n' "$GATE1_FINAL" | jq -rs \
+              '(map(.check_runs // []) | add) | map(select(.name != "Green Gate" and .name != "Skeptic Gate" and .name != "Staging Canary Gate")) | length' 2>/dev/null || echo "0")
+          else
+            CHECK_RUNS_FAILED="__API_ERROR__"
+            CHECK_RUNS_PENDING="__API_ERROR__"
+            TOTAL_EXTERNAL="0"
+          fi
+
+          CI_STATUS_JSON=$(gh api repos/${{ github.repository }}/commits/"$HEAD_SHA"/status \
+            --jq '{state: .state, total: .total_count}' 2>/dev/null || echo '{"state":"error","total":0}')
+          CI_STATUS=$(echo "$CI_STATUS_JSON" | jq -r '.state')
+
+          CI_DETAIL="commit-status=$CI_STATUS, failed-checks=${CHECK_RUNS_FAILED:-0}, pending-checks=${CHECK_RUNS_PENDING:-0}, external-checks=${TOTAL_EXTERNAL:-0}"
+
+          if [ "${CHECK_RUNS_FAILED:-0}" = "__API_ERROR__" ] || [ "${CHECK_RUNS_PENDING:-0}" = "__API_ERROR__" ]; then
+            GATE1="FAIL"
+            FAILED_GATES="${FAILED_GATES}1, "
+            CI_DETAIL="${CI_DETAIL} (check-runs API error)"
+          elif [ "${CHECK_RUNS_FAILED:-0}" -gt 0 ]; then
+            GATE1="FAIL"
+            FAILED_GATES="${FAILED_GATES}1, "
+          elif [ "${TOTAL_EXTERNAL:-0}" -eq 0 ]; then
+            # No external CI checks configured — pass as neutral
+            GATE1="PASS"
+            CI_DETAIL="${CI_DETAIL} (no external CI configured)"
+          elif [ "${CHECK_RUNS_PENDING:-0}" -eq 0 ] && [ "${CHECK_RUNS_FAILED:-0}" -eq 0 ]; then
+            GATE1="PASS"
+          else
+            GATE1="FAIL"
+            FAILED_GATES="${FAILED_GATES}1, "
+            CI_DETAIL="${CI_DETAIL} (timeout waiting for CI)"
+          fi
+          echo "Gate 1: $GATE1 ($CI_DETAIL)"
+          GATE_ROWS="${GATE_ROWS}| 1. CI green | ${GATE1} | ${CI_DETAIL} |\n"
+
+          # ----------------------------------------------------------------
+          # Gate 2: No merge conflicts
+          # ----------------------------------------------------------------
+          PR_META="{}"
+          MERGEABLE="unknown"
+          MERGED_FLAG="false"
+          MERGEABLE_STATE="unknown"
+          for _attempt in 1 2 3 4 5 6; do
+            PR_META=$(gh api repos/${{ github.repository }}/pulls/"$PR_NUM" \
+              --jq '{mergeable: .mergeable, mergeable_state: .mergeable_state, merged: .merged}' 2>/dev/null || echo '{}')
+            MERGEABLE=$(echo "$PR_META" | jq -r 'if .mergeable == null then "unknown" else (.mergeable | tostring) end')
+            MERGED_FLAG=$(echo "$PR_META" | jq -r 'if .merged == null then "false" else (.merged | tostring) end')
+            MERGEABLE_STATE=$(echo "$PR_META" | jq -r '.mergeable_state // "unknown"')
+            if [ "$MERGED_FLAG" = "true" ] || [ "$MERGEABLE" != "unknown" ]; then
+              break
+            fi
+            echo "Mergeability is still unknown; retrying..."
+            sleep 10
+          done
+
+          if [ "$MERGED_FLAG" = "true" ]; then
+            GATE2="PASS"
+            GATE2_DETAIL="already merged"
+          elif [ "$MERGEABLE" = "true" ]; then
+            GATE2="PASS"
+            GATE2_DETAIL="mergeable=$MERGEABLE, state=$MERGEABLE_STATE"
+          else
+            GATE2="FAIL"
+            GATE2_DETAIL="mergeable=$MERGEABLE, state=$MERGEABLE_STATE"
+            FAILED_GATES="${FAILED_GATES}2, "
+          fi
+          echo "Gate 2: $GATE2 ($GATE2_DETAIL)"
+          GATE_ROWS="${GATE_ROWS}| 2. No conflicts | ${GATE2} | ${GATE2_DETAIL} |\n"
+
+          # ----------------------------------------------------------------
+          # Gate 3: CR APPROVED (approved after any CR blocker)
+          # ----------------------------------------------------------------
+          # shellcheck disable=SC2016
+          LATEST_CR=$(gh api repos/${{ github.repository }}/pulls/"$PR_NUM"/reviews --paginate --slurp 2>/dev/null \
+            | jq -r 'flatten
+              | map(select(.user.login == "coderabbitai[bot]")) as $reviews
+              | ($reviews | map(select(.state == "CHANGES_REQUESTED" or .state == "DISMISSED") | .submitted_at) | max // null) as $last_blocker
+              | ($reviews | map(select(.state == "APPROVED") | .submitted_at) | max // null) as $last_approved
+              | if $last_approved == null then "none"
+                elif $last_blocker == null or $last_approved > $last_blocker then "APPROVED"
+                else "CHANGES_REQUESTED"
+                end' 2>/dev/null || echo "none")
+          LATEST_CR="${LATEST_CR:-none}"
+
+          if [ "$LATEST_CR" = "APPROVED" ]; then
+            GATE3="PASS"
+          else
+            GATE3="FAIL"
+            FAILED_GATES="${FAILED_GATES}3, "
+          fi
+          GATE3_DETAIL="state=$LATEST_CR"
+          echo "Gate 3: $GATE3 ($GATE3_DETAIL)"
+          GATE_ROWS="${GATE_ROWS}| 3. CR approved | ${GATE3} | ${GATE3_DETAIL} |\n"
+
+          # ----------------------------------------------------------------
+          # Gate 4: Bugbot clean — use Cursor Bugbot check-run conclusion.
+          # The check-run API is authoritative; text-scanning PR comments
+          # for "error" produces false positives (review comments about
+          # error handling match the pattern).
+          # ----------------------------------------------------------------
+          BUGBOT_CONCLUSION=$(gh api repos/${{ github.repository }}/commits/"$HEAD_SHA"/check-runs \
+            --jq '[.check_runs[] | select(.name == "Cursor Bugbot")] | sort_by(.started_at) | reverse | .[0].conclusion // "none"' \
+            2>/dev/null || echo "none")
+
+          if [ "$BUGBOT_CONCLUSION" = "failure" ]; then
+            GATE4="FAIL"
+            FAILED_GATES="${FAILED_GATES}4, "
+          else
+            GATE4="PASS"
+          fi
+          GATE4_DETAIL="check-run=$BUGBOT_CONCLUSION"
+          echo "Gate 4: $GATE4 ($GATE4_DETAIL)"
+          GATE_ROWS="${GATE_ROWS}| 4. Bugbot clean | ${GATE4} | ${GATE4_DETAIL} |\n"
+
+          # ----------------------------------------------------------------
+          # Gate 5: Inline comments resolved (GraphQL — REST lacks isResolved)
+          # ----------------------------------------------------------------
+          PR_AUTHOR=$(gh api repos/${{ github.repository }}/pulls/"$PR_NUM" --jq '.user.login' 2>/dev/null || echo "")
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          # shellcheck disable=SC2016
+          GQL_RESULT=$(gh api graphql -f query='
+            query($owner: String!, $name: String!, $number: Int!) {
+              repository(owner: $owner, name: $name) {
+                pullRequest(number: $number) {
+                  reviewThreads(first: 100) {
+                    pageInfo { hasNextPage }
+                    nodes {
+                      isResolved
+                      comments(first: 50) {
+                        pageInfo { hasNextPage }
+                        nodes { author { login } body }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ' -f owner='${{ github.repository_owner }}' -f name="$REPO_NAME" -F number="$PR_NUM" 2>/dev/null)
+
+          if [ -z "$GQL_RESULT" ]; then
+            UNRESOLVED="__GQL_ERROR__"
+          elif [ "$(echo "$GQL_RESULT" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage')" = "true" ] || \
+               [ "$(echo "$GQL_RESULT" | jq -r '[.data.repository.pullRequest.reviewThreads.nodes[].comments.pageInfo.hasNextPage | select(. == true)] | length')" -gt 0 ]; then
+            UNRESOLVED="__TRUNCATED__"
+          else
+            UNRESOLVED=$(echo "$GQL_RESULT" | jq -r "[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false) | .comments.nodes[] | select(.author.login != null and (.author.login | ascii_downcase) != (\"$PR_AUTHOR\" | ascii_downcase) and (.body | test(\"^\\\\s*(nit:|nitpick)\"; \"i\") | not))] | length")
+          fi
+
+          # Gate 5: Inline comments resolved
+          # If CR has APPROVED, non-nit unresolved comments are non-blocking (CR
+          # has already signed off despite the noise). Without CR APPROVED, unresolved
+          # comments remain a hard failure (fail-closed).
+          if [ "$LATEST_CR" = "APPROVED" ]; then
+            GATE5="PASS"
+            GATE5_DETAIL="${UNRESOLVED:-N/A} unresolved (CR approved — non-blocking)"
+          elif [ "$UNRESOLVED" = "__GQL_ERROR__" ] || [ "$UNRESOLVED" = "__TRUNCATED__" ]; then
+            GATE5="FAIL"
+            GATE5_DETAIL="$UNRESOLVED (fail-closed)"
+            FAILED_GATES="${FAILED_GATES}5, "
+          elif [ "${UNRESOLVED:-0}" -gt 0 ]; then
+            GATE5="FAIL"
+            GATE5_DETAIL="${UNRESOLVED} unresolved"
+            FAILED_GATES="${FAILED_GATES}5, "
+          else
+            GATE5="PASS"
+            GATE5_DETAIL="all resolved"
+          fi
+          echo "Gate 5: $GATE5 ($GATE5_DETAIL)"
+          GATE_ROWS="${GATE_ROWS}| 5. Comments resolved | ${GATE5} | ${GATE5_DETAIL} |\n"
+
+          # ----------------------------------------------------------------
+          # Gate 6: Evidence format check — advisory (WARN, not FAIL).
+          #
+          # Checks the Evidence section of the PR body for:
+          # - Markdown image with HTTPS URL ( ![alt](https://...) )
+          # - Code block ( ``` )
+          # - Structured output reference (**Test output** or **Terminal output**)
+          # - Fabricated/placeholder patterns (rejects: simulated, example.com,
+          #   <screenshot path>, <value>, TODO, TBD)
+          #
+          # This is advisory (WARN) because the LLM skeptic path covers evidence
+          # authenticity; Gate 6 is a fast deterministic supplement only.
+          # ----------------------------------------------------------------
+          PR_BODY_GATE6=$(gh api repos/${{ github.repository }}/pulls/"$PR_NUM" --jq '.body // ""' 2>/dev/null || echo "")
+
+          GATE6_DETAIL="no_evidence_section"
+          if [ -n "$PR_BODY_GATE6" ]; then
+            # Extract Evidence section: from "## Evidence" to next ## heading
+            # Strip HTML comment lines (<!-- ... -->) before scanning
+            EVIDENCE_GATE6=$(printf '%s\n' "$PR_BODY_GATE6" | awk '
+              BEGIN { IGNORECASE=1; in_section=0; in_comment=0 }
+              /<!--.*-->/ { next }
+              in_comment && /^[[:space:]]*-->/ { in_comment=0; next }
+              /^[[:space:]]*<!--/ { in_comment=1; next }
+              in_comment { next }
+              /^[[:space:]]*##[[:space:]]+evidence([[:space:]]|$)/ { in_section=1; next }
+              in_section && /^[[:space:]]*##[[:space:]]/ { exit }
+              in_section { print }
+            ' 2>/dev/null || true)
+
+            if [ -n "$EVIDENCE_GATE6" ]; then
+              # Reject fabricated/placeholder patterns (fail-closed on fabrication)
+              if printf '%s' "$EVIDENCE_GATE6" | grep -qiE '\bsimulated\b'; then
+                GATE6="FAIL"
+                GATE6_DETAIL="fabricated_content_detected"
+              elif printf '%s' "$EVIDENCE_GATE6" | grep -qiE 'https?://(www\.)?example\.com'; then
+                GATE6="FAIL"
+                GATE6_DETAIL="placeholder_url_detected"
+              elif printf '%s' "$EVIDENCE_GATE6" | grep -qiE '<screenshot[[:space:]]path>|<value>|\bTODO\b|\bTBD\b'; then
+                GATE6="FAIL"
+                GATE6_DETAIL="placeholder_template_detected"
+              # Require real media (image with HTTPS, code block, or structured output)
+              elif printf '%s' "$EVIDENCE_GATE6" | grep -qiE '!\[[^]]*\]\(https://[^)]+\)'; then
+                GATE6="WARN"
+                GATE6_DETAIL="image_found_(advisory)"
+              elif printf '%s' "$EVIDENCE_GATE6" | grep -qiE '\*\*(Test|Terminal)\s*output\*\*:[[:space:]]+\S'; then
+                GATE6="WARN"
+                GATE6_DETAIL="structured_output_found_(advisory)"
+              elif printf '%s' "$EVIDENCE_GATE6" | grep -q '```'; then
+                GATE6="WARN"
+                GATE6_DETAIL="code_block_found_(advisory)"
+              else
+                GATE6="WARN"
+                GATE6_DETAIL="evidence_section_present_(no_media_detected)"
+              fi
+            else
+              GATE6="WARN"
+              GATE6_DETAIL="empty_evidence_section"
+            fi
+          else
+            GATE6="WARN"
+            GATE6_DETAIL="no_pr_body"
+          fi
+
+          # Gate 6 is advisory only — never adds to FAILED_GATES
+          echo "Gate 6: $GATE6 ($GATE6_DETAIL)"
+          GATE_ROWS="${GATE_ROWS}| 6. Evidence format | ${GATE6} | ${GATE6_DETAIL} |\n"
+
+          # ----------------------------------------------------------------
+          # Build result
+          # ----------------------------------------------------------------
+          # Trim trailing ", " from FAILED_GATES
+          FAILED_GATES="${FAILED_GATES%, }"
+
+          if [ -z "$FAILED_GATES" ]; then
+            OVERALL="PASS"
+            RESULT_LINE="**Result: PASS** — all gates green"
+          else
+            OVERALL="FAIL"
+            RESULT_LINE="**Result: FAIL** — gates ${FAILED_GATES} failed"
+          fi
+
+          {
+            echo "overall=$OVERALL"
+            echo "head_sha=$HEAD_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+          # Build the comment body
+          COMMENT_BODY="## Green Gate — Deterministic 6-Green Check
+
+          | Gate | Result | Detail |
+          |------|--------|--------|
+          $(printf '%b' "$GATE_ROWS")
+
+          ${RESULT_LINE}
+
+          VERDICT: ${OVERALL}
+          <!-- green-gate-result-${HEAD_SHA} -->
+          <!-- HEAD-SHA: ${HEAD_SHA} -->"
+
+          # Add actionable guidance when evidence gate fails
+          if [ "$GATE6" = "FAIL" ]; then
+            GATE6_HELP="**Evidence Gate FAIL — fabricated or placeholder content detected**
+
+          Gate 6 fails when the \`## Evidence\` section contains fabricated or placeholder patterns.
+
+          Remove any of the following from your PR description's Evidence section:
+          - The word \`simulated\` (or any invented test output)
+          - URLs like \`https://example.com\` or other non-real links
+          - Placeholder text: \`<screenshot path>\`, \`<value>\`, \`TODO\`, \`TBD\`
+
+          Then re-run this gate."
+            COMMENT_BODY="${COMMENT_BODY}
+
+          ${GATE6_HELP}"
+          fi
+
+          # Remove leading whitespace from heredoc-style indentation
+          COMMENT_BODY=$(printf '%s\n' "$COMMENT_BODY" | awk '{ sub(/^          /, ""); print }')
+
+          {
+            echo "comment_body<<COMMENT_EOF"
+            echo "$COMMENT_BODY"
+            echo "COMMENT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post gate results comment
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUM: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
+          HEAD_SHA: ${{ steps.gates.outputs.head_sha }}
+          COMMENT_BODY: ${{ steps.gates.outputs.comment_body }}
+        run: |
+          # Delete previous green-gate result comments to avoid clutter
+          PREV_COMMENTS=$(gh api repos/${{ github.repository }}/issues/"$PR_NUM"/comments \
+            --paginate \
+            --jq '[.[] | select(.user.login == "github-actions[bot]" and ((.body | test("green-gate-result-")) or ((.body | test("Skeptic Gate")) and (.body | test("<!--[[:space:]]*HEAD-SHA:[[:space:]]*[a-f0-9]+[[:space:]]*-->"))))) | .id]' 2>/dev/null || echo "[]")
+
+          for CID in $(echo "$PREV_COMMENTS" | jq -r '.[]' 2>/dev/null); do
+            gh api repos/${{ github.repository }}/issues/comments/"$CID" --method DELETE 2>/dev/null || true
+          done
+
+          # Post the new comment
+          gh api repos/${{ github.repository }}/issues/"$PR_NUM"/comments \
+            --field body="$COMMENT_BODY" \
+            --jq '.id' > /dev/null 2>&1
+          echo "Posted gate results comment on PR #$PR_NUM"
+
+      - name: Set check result
+        if: always()
+        env:
+          OVERALL: ${{ steps.gates.outputs.overall }}
+        run: |
+          if [ "$OVERALL" = "PASS" ]; then
+            echo "Green Gate: PASS"
+            exit 0
+          else
+            echo "Green Gate: FAIL"
+            exit 1
+          fi
