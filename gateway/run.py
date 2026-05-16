@@ -32,7 +32,6 @@ import logging
 import os
 import re
 import shlex
-import subprocess
 import sys
 import signal
 import tempfile
@@ -6611,56 +6610,6 @@ class GatewayRunner:
             if self._should_send_telegram_lobby_reminder(source):
                 return self._telegram_topic_root_lobby_message()
             return None
-
-        # ── Per-channel concurrent session cap ────────────────────────
-        # Guard A: Reject new session if channel already has too many active ones.
-        # This prevents a single Slack channel from spawning hundreds of concurrent
-        # agents (e.g., the 2026-05-15 storm that caused loadavg=205 and a crash).
-        _MAX_SESSIONS_PER_CHANNEL = 10
-        if source.chat_id:
-            _active_for_channel = sum(
-                1 for _sk in self._running_agents
-                if (lambda _p: _p is not None and _p.get("chat_id") == source.chat_id)(
-                    _parse_session_key(_sk)
-                )
-            )
-            if _active_for_channel >= _MAX_SESSIONS_PER_CHANNEL:
-                logger.warning(
-                    "Per-channel cap hit: chat_id=%s has %d active sessions (cap=%d). "
-                    "Rejecting new session for key %s.",
-                    source.chat_id, _active_for_channel, _MAX_SESSIONS_PER_CHANNEL, _quick_key,
-                )
-                return (
-                    f"⚠️ This channel already has {_active_for_channel} concurrent sessions "
-                    f"(cap={_MAX_SESSIONS_PER_CHANNEL}). Wait for active sessions to complete "
-                    f"before starting a new one."
-                )
-
-        # ── System load gate ──────────────────────────────────────────
-        # Guard B: Reject new session if system load is critically high.
-        # Uses sysctl on macOS, /proc/loadavg on Linux.
-        _LOAD_GATE = 20.0
-        try:
-            if sys.platform == "darwin":
-                _load_out = subprocess.check_output(
-                    ["sysctl", "-n", "vm.loadavg"], text=True, timeout=2
-                ).split()
-                # format: "{ 1.23 4.56 7.89 }" → index 1
-                _load_1m = float(_load_out[1])
-            else:
-                with open("/proc/loadavg") as _lf:
-                    _load_1m = float(_lf.read().split()[0])
-            if _load_1m > _LOAD_GATE:
-                logger.warning(
-                    "System load gate: load_1m=%.1f > %.1f, declining session spawn for %s.",
-                    _load_1m, _LOAD_GATE, _quick_key,
-                )
-                return (
-                    f"⚠️ System load is {_load_1m:.1f} (gate={_LOAD_GATE:.0f}). "
-                    f"New agent sessions are paused until load stabilizes. Please retry shortly."
-                )
-        except (subprocess.SubprocessError, OSError, IndexError, ValueError, TimeoutError):
-            pass  # Never block on load-check failure
 
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
