@@ -41,7 +41,8 @@ jobs:
                   head: {ref: .head.ref, sha: .head.sha},
                   base: {ref: .base.ref, id: .base.repo.id},
                   same_repo: (.head.repo.id == .base.repo.id),
-                  mergeable
+                  mergeable,
+                  author: .user.login
                 }
             ]')
 
@@ -70,6 +71,7 @@ jobs:
 
             # Fetch PR head SHA once — used by CR_READY fallback (step 3) and BUGBOT_ERRORS (step 4).
             # Null guard: if gh api fails, fail closed — do not merge with empty SHA.
+            PR_AUTHOR_LOGIN=$(echo "$PR_DATA" | jq -r '.author // ""')
             PR_HEAD=$(gh api repos/${{ github.repository }}/pulls/"$PR_NUM" --jq '.head.sha' 2>/dev/null) || {
               echo "  ERROR: gh api PR head failed — skipping"
               continue
@@ -126,6 +128,11 @@ jobs:
             # Extract latest CHANGES_REQUESTED/DISMISSED and APPROVED timestamps from all CR reviews,
             # then check APPROVED > latest blocker. --slurp flattens paginated pages.
             # DISMISSED is a dismissed CHANGES_REQUESTED — always blocking (not resolved).
+            # dependabot[bot] PRs auto-PASS — automated version bumps need no CR review
+            if [[ "$PR_AUTHOR_LOGIN" == "dependabot[bot]" ]]; then
+              echo "  [3] CR: PASS (dependabot PR — CR gate auto-PASS)"
+              CR_PASS="true"
+            else
             CR_APPROVED_AFTER_CHANGES=$(gh api repos/${{ github.repository }}/pulls/"$PR_NUM"/reviews --paginate --slurp \
               | jq -r '[.[][] | select(.user.login == "coderabbitai[bot]")] |
                 (map(select(.state == "CHANGES_REQUESTED" or .state == "DISMISSED") | .submitted_at) | max // null) as $last_blocker |
@@ -160,6 +167,7 @@ jobs:
                 echo "  [3] CR: FAIL (no APPROVED after latest CHANGES_REQUESTED)"
               fi
             fi
+            fi  # end dependabot[bot] exemption else
 
             # PR_HEAD (fetched at top of loop) is used by both Gate 4 (bugbot) and Gate 7 (skeptic).
 
