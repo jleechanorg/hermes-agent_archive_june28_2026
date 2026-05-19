@@ -207,26 +207,34 @@ jobs:
 
           # ----------------------------------------------------------------
           # Gate 3: CR APPROVED (approved after any CR blocker)
+          # dependabot[bot] PRs auto-PASS — automated version bumps need no CR review
           # ----------------------------------------------------------------
-          # shellcheck disable=SC2016
-          LATEST_CR=$(gh api repos/${{ github.repository }}/pulls/"$PR_NUM"/reviews --paginate --slurp 2>/dev/null \
-            | jq -r 'flatten
-              | map(select(.user.login == "coderabbitai[bot]")) as $reviews
-              | ($reviews | map(select(.state == "CHANGES_REQUESTED" or .state == "DISMISSED") | .submitted_at) | max // null) as $last_blocker
-              | ($reviews | map(select(.state == "APPROVED") | .submitted_at) | max // null) as $last_approved
-              | if $last_approved == null then "none"
-                elif $last_blocker == null or $last_approved > $last_blocker then "APPROVED"
-                else "CHANGES_REQUESTED"
-                end' 2>/dev/null || echo "none")
-          LATEST_CR="${LATEST_CR:-none}"
-
-          if [ "$LATEST_CR" = "APPROVED" ]; then
+          PR_GATE3_AUTHOR=$(gh api repos/${{ github.repository }}/pulls/"$PR_NUM" --jq '.user.login' 2>/dev/null || echo "")
+          if [ "$PR_GATE3_AUTHOR" = "dependabot[bot]" ]; then
             GATE3="PASS"
+            GATE3_DETAIL="dependabot PR — CR gate auto-PASS"
+            LATEST_CR="APPROVED"  # Gate 5 LATEST_CR fast-path needs this set
           else
-            GATE3="FAIL"
-            FAILED_GATES="${FAILED_GATES}3, "
+            # shellcheck disable=SC2016
+            LATEST_CR=$(gh api repos/${{ github.repository }}/pulls/"$PR_NUM"/reviews --paginate --slurp 2>/dev/null \
+              | jq -r 'flatten
+                | map(select(.user.login == "coderabbitai[bot]")) as $reviews
+                | ($reviews | map(select(.state == "CHANGES_REQUESTED" or .state == "DISMISSED") | .submitted_at) | max // null) as $last_blocker
+                | ($reviews | map(select(.state == "APPROVED") | .submitted_at) | max // null) as $last_approved
+                | if $last_approved == null then "none"
+                  elif $last_blocker == null or $last_approved > $last_blocker then "APPROVED"
+                  else "CHANGES_REQUESTED"
+                  end' 2>/dev/null || echo "none")
+            LATEST_CR="${LATEST_CR:-none}"
+
+            if [ "$LATEST_CR" = "APPROVED" ]; then
+              GATE3="PASS"
+            else
+              GATE3="FAIL"
+              FAILED_GATES="${FAILED_GATES}3, "
+            fi
+            GATE3_DETAIL="state=$LATEST_CR"
           fi
-          GATE3_DETAIL="state=$LATEST_CR"
           echo "Gate 3: $GATE3 ($GATE3_DETAIL)"
           GATE_ROWS="${GATE_ROWS}| 3. CR approved | ${GATE3} | ${GATE3_DETAIL} |\n"
 
