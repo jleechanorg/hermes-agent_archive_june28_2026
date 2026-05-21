@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -811,3 +812,90 @@ class TestPlannedStopMarker:
         ok = status.write_planned_stop_marker(target_pid=12345)
 
         assert ok is False
+
+
+class TestGetProcessStartTimeMacOS:
+    """Tests for the macOS code path of _get_process_start_time."""
+
+    def test_darwin_uses_sha256_of_lstart(self, monkeypatch):
+        import hashlib
+
+        monkeypatch.setattr(status.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            status.subprocess,
+            "check_output",
+            lambda *a, **kw: b"Wed May 21 10:00:00 2025",
+        )
+        # /proc must fail on darwin
+        monkeypatch.setattr(
+            status.Path,
+            "read_text",
+            lambda self, **kw: (_ for _ in ()).throw(FileNotFoundError),
+        )
+
+        result = status._get_process_start_time(os.getpid())
+        expected = int(hashlib.sha256("Wed May 21 10:00:00 2025".encode()).hexdigest()[:16], 16)
+        assert result == expected
+
+    def test_darwin_pins_lc_all_c(self, monkeypatch):
+        """LC_ALL=C ensures lstart output is locale-independent."""
+        captured_env = {}
+
+        def fake_check_output(cmd, **kwargs):
+            captured_env.update(kwargs.get("env", {}))
+            return b"Wed May 21 10:00:00 2025"
+
+        monkeypatch.setattr(status.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            status.Path,
+            "read_text",
+            lambda self, **kw: (_ for _ in ()).throw(FileNotFoundError),
+        )
+        monkeypatch.setattr(status.subprocess, "check_output", fake_check_output)
+
+        status._get_process_start_time(os.getpid())
+        assert captured_env.get("LC_ALL") == "C"
+
+    def test_darwin_returns_none_on_empty_output(self, monkeypatch):
+        monkeypatch.setattr(status.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            status.Path,
+            "read_text",
+            lambda self, **kw: (_ for _ in ()).throw(FileNotFoundError),
+        )
+        monkeypatch.setattr(status.subprocess, "check_output", lambda *a, **kw: b"  \n")
+        result = status._get_process_start_time(os.getpid())
+        assert result is None
+
+    def test_darwin_returns_none_on_subprocess_error(self, monkeypatch):
+        monkeypatch.setattr(status.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            status.Path,
+            "read_text",
+            lambda self, **kw: (_ for _ in ()).throw(FileNotFoundError),
+        )
+        monkeypatch.setattr(
+            status.subprocess,
+            "check_output",
+            lambda *a, **kw: (_ for _ in ()).throw(subprocess.CalledProcessError(1, "ps")),
+        )
+        result = status._get_process_start_time(os.getpid())
+        assert result is None
+
+    def test_darwin_hash_is_stable_across_calls(self, monkeypatch):
+        """Verify sha256 digest is deterministic (unlike Python's hash())."""
+        monkeypatch.setattr(status.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            status.Path,
+            "read_text",
+            lambda self, **kw: (_ for _ in ()).throw(FileNotFoundError),
+        )
+        monkeypatch.setattr(
+            status.subprocess,
+            "check_output",
+            lambda *a, **kw: b"Thu Jun  5 14:30:00 2025",
+        )
+        r1 = status._get_process_start_time(os.getpid())
+        r2 = status._get_process_start_time(os.getpid())
+        assert r1 == r2
+        assert isinstance(r1, int)

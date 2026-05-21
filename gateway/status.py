@@ -109,13 +109,35 @@ def _get_scope_lock_path(scope: str, identity: str) -> Path:
 
 
 def _get_process_start_time(pid: int) -> Optional[int]:
-    """Return the kernel start time for a process when available."""
+    """Return the kernel start time for a process when available.
+
+    On Linux, returns field 22 from /proc/<pid>/stat (clock ticks).
+    On macOS, returns a deterministic hash of the ps lstart string
+    so that planned-stop and takeover markers can verify PID identity
+    even without /proc.  Uses hashlib (not hash()) to ensure the
+    value is stable across Python processes (PYTHONHASHSEED randomizes
+    the built-in hash()).
+    """
     stat_path = Path(f"/proc/{pid}/stat")
     try:
-        # Field 22 in /proc/<pid>/stat is process start time (clock ticks).
         return int(stat_path.read_text(encoding="utf-8").split()[21])
     except (FileNotFoundError, IndexError, PermissionError, ValueError, OSError):
-        return None
+        pass
+    if sys.platform == "darwin":
+        try:
+            env = {**os.environ, "LC_ALL": "C"}
+            out = subprocess.check_output(
+                ["ps", "-o", "lstart=", "-p", str(pid)],
+                stderr=subprocess.DEVNULL,
+                env=env,
+            ).decode().strip()
+            if out:
+                digest = hashlib.sha256(out.encode()).hexdigest()
+                return int(digest[:16], 16)
+            return None
+        except (subprocess.CalledProcessError, OSError):
+            pass
+    return None
 
 
 def get_process_start_time(pid: int) -> Optional[int]:
