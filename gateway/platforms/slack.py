@@ -1772,15 +1772,14 @@ class SlackAdapter(BasePlatformAdapter):
                 return
 
             # Prevent loops between different hermes bot instances (production @hermes and staging @hermes_staging)
-            # Check by user ID, bot ID, app ID, and username to be extremely robust.
+            # Block by user ID or bot ID only — NOT by app_id, which is too broad and
+            # would also block human users posting via XOXP tokens associated with the same app.
             msg_bot_id = event.get("bot_id", "")
-            msg_app_id = event.get("app_id", "")
             msg_username = (event.get("username") or "").lower().strip()
 
             if (
                 (msg_user and msg_user in ("U0AEZC7RX1Q", "U0APZAB0DUZ")) or
                 (msg_bot_id and msg_bot_id in ("B0AEHUEA0JK", "B0APE1TT42F")) or
-                (msg_app_id and msg_app_id in ("A0AESRKA7L3", "A0APZAC659P")) or
                 (msg_username in ("hermes", "hermes_staging", "hermes staging", "hermes-staging"))
             ):
                 logger.info(
