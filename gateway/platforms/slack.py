@@ -1770,6 +1770,9 @@ class SlackAdapter(BasePlatformAdapter):
             msg_user = event.get("user", "")
             if msg_user and self._bot_user_id and msg_user == self._bot_user_id:
                 return
+            # Prevent loops between different hermes bot instances (production @hermes and staging @hermes_staging)
+            if msg_user in ("U0AEZC7RX1Q", "U0APZAB0DUZ"):
+                return
 
         # Ignore message edits and deletions
         subtype = event.get("subtype")
