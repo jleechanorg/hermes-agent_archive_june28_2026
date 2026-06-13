@@ -48,6 +48,9 @@ def _load_config() -> dict:
 
     config = {
         "api_key": os.environ.get("MEM0_API_KEY", ""),
+        # When set (e.g. http://localhost:8000), use a self-hosted mem0 REST
+        # server instead of the Mem0 Platform cloud API. mem0.json may override.
+        "host": os.environ.get("MEM0_HOST", ""),
         "user_id": os.environ.get("MEM0_USER_ID", "hermes-user"),
         "agent_id": os.environ.get("MEM0_AGENT_ID", "hermes"),
         "rerank": True,
@@ -64,6 +67,76 @@ def _load_config() -> dict:
             pass
 
     return config
+
+
+# ---------------------------------------------------------------------------
+# Self-hosted REST adapter
+# ---------------------------------------------------------------------------
+
+
+class _LocalMem0Client:
+    """Adapter exposing the subset of the mem0 ``MemoryClient`` surface that
+    this plugin uses (``search`` / ``add`` / ``get_all``) against a self-hosted
+    mem0 REST server (``mem0_server.py``: ``POST /search``, ``POST /memories``,
+    ``GET /memories``). Lets the plugin run fully local (Qdrant + Ollama) with
+    no Mem0 Platform cloud account, selected by setting ``host`` in mem0.json.
+    """
+
+    def __init__(self, host: str, *, search_timeout: int = 30,
+                 add_timeout: int = 180) -> None:
+        self._base = host.rstrip("/")
+        self._search_timeout = search_timeout
+        self._add_timeout = add_timeout
+
+    def _post(self, path: str, payload: Dict[str, Any], timeout: int) -> Any:
+        import urllib.request
+
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            self._base + path, data=data,
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _get(self, path: str, params: Dict[str, Any], timeout: int) -> Any:
+        import urllib.parse
+        import urllib.request
+
+        qs = urllib.parse.urlencode(
+            {k: v for k, v in params.items() if v is not None})
+        url = self._base + path + (("?" + qs) if qs else "")
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def search(self, query: str, filters: Dict[str, Any] | None = None,
+               rerank: bool = False, top_k: int = 10, **_: Any) -> Any:
+        filters = filters or {}
+        return self._post("/search", {
+            "query": query,
+            "user_id": filters.get("user_id"),
+            "agent_id": filters.get("agent_id"),
+            "limit": top_k,
+            "rerank": bool(rerank),
+        }, self._search_timeout)
+
+    def add(self, messages: List[Dict[str, Any]], user_id: str | None = None,
+            agent_id: str | None = None, infer: bool = True, **_: Any) -> Any:
+        # mem0_server.py runs server-side fact extraction; ``infer`` is accepted
+        # for MemoryClient parity (verbatim store not yet supported server-side).
+        return self._post("/memories", {
+            "messages": messages,
+            "user_id": user_id,
+            "agent_id": agent_id,
+        }, self._add_timeout)
+
+    def get_all(self, filters: Dict[str, Any] | None = None, **_: Any) -> Any:
+        filters = filters or {}
+        return self._get("/memories", {
+            "user_id": filters.get("user_id"),
+            "agent_id": filters.get("agent_id"),
+            "limit": 100,
+        }, self._search_timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +197,7 @@ class Mem0MemoryProvider(MemoryProvider):
         self._client = None
         self._client_lock = threading.Lock()
         self._api_key = ""
+        self._host = ""
         self._user_id = "hermes-user"
         self._agent_id = "hermes"
         self._rerank = True
@@ -141,7 +215,8 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def is_available(self) -> bool:
         cfg = _load_config()
-        return bool(cfg.get("api_key"))
+        # Available with either a cloud api_key or a self-hosted REST host.
+        return bool(cfg.get("api_key") or cfg.get("host"))
 
     def save_config(self, values, hermes_home):
         """Write config to $HERMES_HOME/mem0.json."""
@@ -169,6 +244,11 @@ class Mem0MemoryProvider(MemoryProvider):
         """Thread-safe client accessor with lazy initialization."""
         with self._client_lock:
             if self._client is not None:
+                return self._client
+            # Self-hosted REST backend (local Qdrant + Ollama via mem0_server.py)
+            # takes precedence when a host is configured — no cloud account.
+            if self._host:
+                self._client = _LocalMem0Client(self._host)
                 return self._client
             try:
                 from mem0 import MemoryClient
@@ -203,6 +283,7 @@ class Mem0MemoryProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs) -> None:
         self._config = _load_config()
         self._api_key = self._config.get("api_key", "")
+        self._host = (self._config.get("host") or "").strip()
         # Prefer gateway-provided user_id for per-user memory scoping;
         # fall back to config/env default for CLI (single-user) sessions.
         self._user_id = kwargs.get("user_id") or self._config.get("user_id", "hermes-user")
