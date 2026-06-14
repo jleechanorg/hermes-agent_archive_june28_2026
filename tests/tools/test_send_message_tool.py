@@ -27,6 +27,7 @@ from tools.send_message_tool import (
     _send_discord,
     _send_matrix_via_adapter,
     _send_signal,
+    _send_slack,
     _send_telegram,
     _send_to_platform,
     send_message_tool,
@@ -397,6 +398,7 @@ class TestSendToPlatformChunking:
             "***",
             "C123",
             "*hello* from <https://example.com|Hermes>",
+            thread_id=None,
         )
 
     def test_slack_bold_italic_formatted_before_send(self, monkeypatch):
@@ -952,6 +954,263 @@ class TestParseTargetRefSlack:
     def test_slack_id_not_explicit_for_other_platforms(self):
         assert _parse_target_ref("discord", "C0B0QV5434G")[2] is False
         assert _parse_target_ref("telegram", "C0B0QV5434G")[2] is False
+
+    def test_slack_3part_target_extracts_thread_ts(self):
+        """3-part form `slack:CHAN:thread_ts` is the canonical threaded reply.
+
+        Regression for AO #684 (5th misroute class): the regex used to anchor
+        at the channel ID and reject any `:thread_ts` suffix, so callers
+        with a 3-part target fell through to channel-root posting.
+        """
+        chat_id, thread_id, is_explicit = _parse_target_ref(
+            "slack", "C0AH3RY3DK6:1781465902.728229"
+        )
+        assert chat_id == "C0AH3RY3DK6"
+        assert thread_id == "1781465902.728229"
+        assert is_explicit is True
+
+    def test_slack_3part_target_with_whitespace(self):
+        """Whitespace around a 3-part target is stripped (defensive)."""
+        chat_id, thread_id, _ = _parse_target_ref(
+            "slack", "  C0AH3RY3DK6:1781465902.728229  "
+        )
+        assert chat_id == "C0AH3RY3DK6"
+        assert thread_id == "1781465902.728229"
+
+    def test_slack_2part_target_still_thread_id_none(self):
+        """2-part form `slack:CHAN` (no thread_ts) still returns None."""
+        chat_id, thread_id, is_explicit = _parse_target_ref("slack", "C0B0QV5434G")
+        assert chat_id == "C0B0QV5434G"
+        assert thread_id is None
+        assert is_explicit is True
+
+
+class TestSendSlackThreadTs:
+    """_send_slack forwards thread_id to chat.postMessage as `thread_ts`.
+
+    Regression for AO #684 (5th misroute class) — the LLM-callable
+    send_message tool used to drop the `:thread_ts` segment from a
+    3-part `slack:CHAN:thread_ts` target, so a reply in a specific
+    thread posted to the channel root.
+    """
+
+    @staticmethod
+    def _build_mock(response_status, response_data=None, response_text="error body"):
+        mock_resp = MagicMock()
+        mock_resp.status = response_status
+        mock_resp.json = AsyncMock(return_value=response_data or {"ok": True, "ts": "1781462111.465060"})
+        mock_resp.text = AsyncMock(return_value=response_text)
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=None)
+
+        mock_session = MagicMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=None)
+        mock_session.post = MagicMock(return_value=mock_resp)
+
+        return mock_session, mock_resp
+
+    def _run(self, token, chat_id, message, thread_id=None):
+        return asyncio.run(
+            _send_slack(token, chat_id, message, thread_id=thread_id)
+        )
+
+    def test_with_thread_id_includes_thread_ts_in_payload(self):
+        """When thread_id is set, the chat.postMessage payload carries it."""
+        mock_session, _ = self._build_mock(200)
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            self._run("tok", "C0AH3RY3DK6", "hello in thread", thread_id="1781465902.728229")
+        kwargs = mock_session.post.call_args.kwargs
+        payload = kwargs["json"]
+        assert payload["channel"] == "C0AH3RY3DK6"
+        assert payload["text"] == "hello in thread"
+        assert payload["thread_ts"] == "1781465902.728229"
+
+    def test_without_thread_id_omits_thread_ts(self):
+        """When thread_id is None, no `thread_ts` key in payload (channel root)."""
+        mock_session, _ = self._build_mock(200)
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            self._run("tok", "C0AH3RY3DK6", "hello channel")
+        kwargs = mock_session.post.call_args.kwargs
+        payload = kwargs["json"]
+        assert payload["channel"] == "C0AH3RY3DK6"
+        assert "thread_ts" not in payload
+
+    def test_posts_to_slack_chat_postmessage_url(self):
+        """Endpoint is the canonical chat.postMessage URL."""
+        mock_session, _ = self._build_mock(200)
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            self._run("tok", "C0AH3RY3DK6", "hi")
+        call_url = mock_session.post.call_args.args[0]
+        assert call_url == "https://slack.com/api/chat.postMessage"
+
+    def test_success_returns_message_id(self):
+        """On `ok: True`, returns success + message_id (the Slack ts)."""
+        # The Slack API echoes the posted message back under the
+        # `message` key. We include message.thread_ts so the AO #684
+        # fail-loud check (which fires when the response is missing
+        # thread_ts after the caller asked for one) does NOT trip.
+        mock_session, _ = self._build_mock(
+            200,
+            response_data={
+                "ok": True,
+                "ts": "1781462111.465060",
+                "message": {
+                    "ts": "1781462111.465060",
+                    "thread_ts": "1781465902.728229",
+                    "text": "echo",
+                },
+            },
+        )
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            result = self._run("tok", "C0AH3RY3DK6", "hi", thread_id="1781465902.728229")
+        assert result["success"] is True
+        assert result["message_id"] == "1781462111.465060"
+        assert result["chat_id"] == "C0AH3RY3DK6"
+
+
+class TestSendToPlatformSlackThread:
+    """_send_to_platform passes thread_id through to _send_slack.
+
+    End-to-end wiring: a 3-part target like
+    `slack:C0AH3RY3DK6:1781465902.728229` parsed upstream must reach
+    the chat.postMessage payload as `thread_ts`. This is the layer
+    the AO #684 cluster of misroutes was actually breaking at.
+    """
+
+    def test_slack_3part_target_forwards_thread_id_to_send_slack(self):
+        send_mock = AsyncMock(return_value={"success": True, "message_id": "1"})
+
+        with patch("tools.send_message_tool._send_slack", send_mock):
+            # _parse_target_ref returns ("C0AH3RY3DK6", "1781465902.728229", True)
+            # for a 3-part target — and the call site must forward thread_id.
+            asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="tok", extra={}),
+                    "C0AH3RY3DK6",
+                    "reply in thread",
+                    thread_id="1781465902.728229",
+                )
+            )
+
+        send_mock.assert_awaited_once()
+        _, call_kwargs = send_mock.await_args
+        assert call_kwargs["thread_id"] == "1781465902.728229"
+
+    def test_slack_no_thread_id_when_not_provided(self):
+        """No thread_id → no thread_ts in payload (channel root is correct)."""
+        send_mock = AsyncMock(return_value={"success": True, "message_id": "1"})
+
+        with patch("tools.send_message_tool._send_slack", send_mock):
+            asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="tok", extra={}),
+                    "C0AH3RY3DK6",
+                    "channel-root message",
+                )
+            )
+
+        send_mock.assert_awaited_once()
+        _, call_kwargs = send_mock.await_args
+        assert call_kwargs["thread_id"] is None
+
+
+class TestSendSlackFailLoud:
+    """Fail-loud invariant for AO #684: when the caller requested a
+    thread_ts but the Slack API silently strips it (returns ok=True with
+    no message.thread_ts), the tool must return an error — never silent
+    success.
+
+    Without this, a misrouted out-of-thread post looks identical to a
+    correctly-threaded one to the calling agent, and the agent has no way
+    to know it needs Path A/B recovery. That is the exact failure mode
+    that produced the 10+ AO #684 misroutes since 2026-06-09.
+    """
+
+    @staticmethod
+    def _build_mock_session(ok_payload):
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value=ok_payload)
+        mock_resp.text = AsyncMock(return_value="")
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=None)
+
+        mock_session = MagicMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=None)
+        mock_session.post = MagicMock(return_value=mock_resp)
+        return mock_session
+
+    def test_fail_loud_when_slack_omits_thread_ts_in_response(self):
+        """The misroute shape: ok=True, no message.thread_ts → error result."""
+        # Slack response shape that is the AO #684 misroute signature:
+        # ok=True (request "succeeded") but the message has no thread_ts
+        # (the post landed at the channel root, not in the thread).
+        ok_payload = {
+            "ok": True,
+            "ts": "1781462111.465060",
+            "message": {
+                "ts": "1781462111.465060",
+                # NO thread_ts key — silent strip.
+                "text": "echo",
+            },
+        }
+        mock_session = self._build_mock_session(ok_payload)
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            result = asyncio.run(
+                _send_slack("tok", "C0AH3RY3DK6", "hi", thread_id="1781465902.728229")
+            )
+
+        # Must NOT be silent success — that is the AO #684 bug.
+        assert "error" in result, f"Expected fail-loud error, got {result!r}"
+        assert result.get("success") is None or not result.get("success"), (
+            f"Misrouted post must not report success=True; got {result!r}"
+        )
+        # Error must name the target attempted and the channel landed in.
+        error_text = result.get("error", "")
+        assert "slack:C0AH3RY3DK6:1781465902.728229" in error_text, (
+            f"Error must name the 3-part target attempted: {error_text!r}"
+        )
+        assert "C0AH3RY3DK6" in error_text, (
+            f"Error must name the channel landed in: {error_text!r}"
+        )
+
+    def test_no_fail_loud_when_slack_echoes_thread_ts(self):
+        """Correct path: ok=True with message.thread_ts echoing back → success."""
+        ok_payload = {
+            "ok": True,
+            "ts": "1781462111.465060",
+            "message": {
+                "ts": "1781462111.465060",
+                "thread_ts": "1781465902.728229",
+                "text": "echo",
+            },
+        }
+        mock_session = self._build_mock_session(ok_payload)
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            result = asyncio.run(
+                _send_slack("tok", "C0AH3RY3DK6", "hi", thread_id="1781465902.728229")
+            )
+        assert result.get("success") is True
+        assert "error" not in result
+
+    def test_no_fail_loud_for_channel_root_post(self):
+        """Channel-root post (no thread_id requested) is a valid shape — success."""
+        ok_payload = {
+            "ok": True,
+            "ts": "1781462111.465060",
+            "message": {"ts": "1781462111.465060", "text": "echo"},
+        }
+        mock_session = self._build_mock_session(ok_payload)
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            result = asyncio.run(
+                _send_slack("tok", "C0AH3RY3DK6", "hi")  # no thread_id
+            )
+        assert result.get("success") is True
+        assert "error" not in result
 
 
 class TestSendDiscordThreadId:

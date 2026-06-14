@@ -27,7 +27,13 @@ _FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::(
 # because the API requires a conversation ID. To DM a user you must first call
 # conversations.open to obtain a D... ID. Without this gate, Slack IDs fall
 # through to channel-name resolution, which only matches by name and fails.
-_SLACK_TARGET_RE = re.compile(r"^\s*([CGD][A-Z0-9]{8,})\s*$")
+# 3-part targets `slack:CHAN:thread_ts` are the canonical form for replying
+# in a thread. The thread_ts segment is the parent message's ts (e.g.
+# 1781462111.465059) and is forwarded to chat.postMessage as `thread_ts`.
+# Without the optional suffix, callers had to fall back to channel-root
+# posting — which is the root cause of the 5th misroute class
+# (AO #684: out-of-thread Slack replies from the LLM-callable tool).
+_SLACK_TARGET_RE = re.compile(r"^\s*([CGD][A-Z0-9]{8,})(?::(\d+\.\d+))?\s*$")
 _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Za-z0-9._-]+@chatroom|filehelper)\s*$")
 _YUANBAO_TARGET_RE = re.compile(r"^\s*((?:group|direct):[^:]+)\s*$")
 # Discord snowflake IDs are numeric, same regex pattern as Telegram topic targets.
@@ -332,7 +338,11 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     if platform_name == "slack":
         match = _SLACK_TARGET_RE.fullmatch(target_ref)
         if match:
-            return match.group(1), None, True
+            # 3-part form `slack:CHAN:thread_ts` — forward the captured
+            # thread_ts so _send_to_platform can pass it through to
+            # chat.postMessage as `thread_ts`. Without this, replies to a
+            # specific thread post to the channel root instead (AO #684).
+            return match.group(1), match.group(2), True
     if platform_name == "weixin":
         match = _WEIXIN_TARGET_RE.fullmatch(target_ref)
         if match:
@@ -699,7 +709,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     last_result = None
     for chunk in chunks:
         if platform == Platform.SLACK:
-            result = await _send_slack(pconfig.token, chat_id, chunk)
+            result = await _send_slack(pconfig.token, chat_id, chunk, thread_id=thread_id)
         elif platform == Platform.WHATSAPP:
             result = await _send_whatsapp(pconfig.extra, chat_id, chunk)
         elif platform == Platform.SIGNAL:
@@ -1120,8 +1130,21 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
         return _error(f"Discord send failed: {e}")
 
 
-async def _send_slack(token, chat_id, message):
-    """Send via Slack Web API."""
+async def _send_slack(token, chat_id, message, thread_id=None):
+    """Send via Slack Web API.
+
+    When ``thread_id`` is provided (from a 3-part target like
+    ``slack:CHAN:thread_ts``), the payload includes ``thread_ts`` so the
+    message replies in-thread instead of posting to the channel root.
+    This closes the 5th Slack misroute class (AO #684).
+
+    Fail-loud: if the caller requested a thread_ts but the Slack response
+    does not echo one back on the posted message, return an error result
+    naming the target attempted vs the actual channel landed in. Do not
+    silently return ``success=True`` for a misrouted post — the previous
+    silent-success behavior is exactly what produced the AO #684
+    out-of-thread incident cluster (10+ misroutes since 2026-06-09).
+    """
     try:
         import aiohttp
     except ImportError:
@@ -1134,9 +1157,30 @@ async def _send_slack(token, chat_id, message):
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             payload = {"channel": chat_id, "text": message, "mrkdwn": True}
+            if thread_id:
+                payload["thread_ts"] = thread_id
             async with session.post(url, headers=headers, json=payload, **_req_kw) as resp:
                 data = await resp.json()
                 if data.get("ok"):
+                    posted_message = data.get("message") or {}
+                    # The response carries the post as it was actually written:
+                    # message.thread_ts is the parent ts the message threaded
+                    # under (or absent for channel-root posts). When the caller
+                    # explicitly asked for a thread_ts, an absent/empty
+                    # message.thread_ts is a real misroute — fail loud with
+                    # both the target attempted and the channel landed in.
+                    actual_thread_ts = (
+                        posted_message.get("thread_ts") or data.get("thread_ts")
+                    )
+                    if thread_id and not actual_thread_ts:
+                        return _error(
+                            "Slack honored chat.postMessage with `ok: True` but "
+                            f"the posted message has no `thread_ts` (target attempted: "
+                            f"slack:{chat_id}:{thread_id}; actual channel: {chat_id}). "
+                            "This is the AO #684 misroute shape — do not treat the "
+                            "post as successful. Fall back to Path A/B "
+                            "(slack_mcp_post.sh or direct chat.postMessage with thread_ts)."
+                        )
                     return {"success": True, "platform": "slack", "chat_id": chat_id, "message_id": data.get("ts")}
                 return _error(f"Slack API error: {data.get('error', 'unknown')}")
     except Exception as e:
