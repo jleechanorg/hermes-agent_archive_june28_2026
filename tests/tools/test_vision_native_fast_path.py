@@ -157,6 +157,13 @@ class TestHandleVisionAnalyzeFastPath:
         monkeypatch.setattr(
             "agent.image_routing._explicit_aux_vision_override", lambda _cfg: False
         )
+        # Force vision-capable lookup so the test is deterministic in CI where
+        # models.dev has no disk cache and the network probe may fail. Without
+        # this, the fast path silently falls through to the aux LLM path.
+        monkeypatch.setattr(
+            "agent.image_routing._lookup_supports_vision",
+            lambda _provider, _model: True,
+        )
 
         # Set runtime override so the handler thinks we're on opus@openrouter
         from agent.auxiliary_client import set_runtime_main, clear_runtime_main
