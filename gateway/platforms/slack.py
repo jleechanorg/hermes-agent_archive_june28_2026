@@ -745,6 +745,29 @@ class SlackAdapter(BasePlatformAdapter):
         if not self._app:
             return SendResult(success=False, error="Not connected")
 
+        # Regression guard for the 2026-06-19 11:20:58–11:22:32 UTC
+        # cross-channel misroute (orphan 1781868147.039389 in
+        # C0AJQ5M0A0Y while inbound was from C0AH3RY3DK6). When a handler
+        # is active and the inbound chat_id is pinned, refuse to post to
+        # a different channel — record a violation and return an error
+        # SendResult instead of letting the misalignment reach Slack.
+        # See gateway/outbound_guard.py for the protocol.
+        try:
+            from gateway.outbound_guard import verify_outbound
+            if not verify_outbound(chat_id, operation="slack.send"):
+                return SendResult(
+                    success=False,
+                    error="refused: outbound chat_id does not match active inbound (OutboundGuard)",
+                )
+        except Exception:
+            # Guard is best-effort: never block a real send because of an
+            # internal guard error. Log at debug and continue.
+            import logging as _logging
+            _logging.getLogger(__name__).debug(
+                "OutboundGuard.verify_outbound raised in slack.send; ignoring",
+                exc_info=True,
+            )
+
         try:
             # Check for a pending slash-command context.  When the user ran a
             # native slash command (e.g. /q, /stop, /model), the initial ack
