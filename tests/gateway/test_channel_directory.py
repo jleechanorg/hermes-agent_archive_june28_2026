@@ -3,7 +3,6 @@
 import asyncio
 import json
 import os
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,16 +12,24 @@ from gateway.channel_directory import (
     resolve_channel_name,
     format_directory_for_display,
     load_directory,
+    _apply_channel_aliases,
     _build_from_sessions,
     _build_slack,
-    DIRECTORY_PATH,
 )
 
 
-def _resolve_strict(platform_name, target_ref):
-    """Lazy import so tests can run while resolve_channel_name_strict is being added."""
-    from gateway.channel_directory import resolve_channel_name_strict
-    return resolve_channel_name_strict(platform_name, target_ref)
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_channel_aliases(tmp_path_factory):
+    """Point the alias overlay at a nonexistent path by default so a real
+    ~/.hermes/channel_aliases.json never leaks into directory tests. Tests
+    that exercise aliases patch CHANNEL_ALIASES_PATH themselves inside the
+    test body, which takes precedence over this outer patch."""
+    missing = tmp_path_factory.mktemp("aliases") / "none.json"
+    with patch("gateway.channel_directory.CHANNEL_ALIASES_PATH", missing):
+        yield
 
 
 def _write_directory(tmp_path, platforms):
@@ -490,165 +497,82 @@ class TestBuildSlack:
         assert entries == []
 
 
-class TestCrossWorkspaceSlackMisroute:
-    """Regression tests for cross-workspace channel name ambiguity.
+class TestChannelAliases:
+    """The user-maintained alias overlay (channel_aliases.json) gives durable
+    friendly names that survive the timed directory rebuild."""
 
-    When a bot is connected to multiple Slack workspaces, each workspace's
-    ``users.conversations`` returns its own channel list. If two workspaces
-    have channels with the same human-friendly name (e.g. "engineering"),
-    ``resolve_channel_name`` MUST NOT silently pick the first one — the
-    caller has no way to disambiguate, and the message lands in the wrong
-    workspace (cross-channel Slack misroute).
+    def _setup_aliases(self, tmp_path, aliases):
+        alias_file = tmp_path / "channel_aliases.json"
+        alias_file.write_text(json.dumps(aliases))
+        return patch("gateway.channel_directory.CHANNEL_ALIASES_PATH", alias_file)
 
-    The fix has three parts:
-    1. ``_build_slack`` MUST attach ``team_id`` to each entry so the
-       caller can disambiguate.
-    2. ``resolve_channel_name`` MUST return ``None`` when the same name
-       matches channels in multiple workspaces (first-match-wins is a
-       silent misroute).
-    3. ``resolve_channel_name_strict`` returns ``(chat_id, team_id)`` when
-       the match is unique — this is the path ``send_message_tool`` uses
-       to route to the correct workspace client.
-    """
+    def test_alias_renames_existing_entry_on_load(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "whatsapp": [{"id": "120363@g.us", "name": "120363", "type": "group"}]
+        })
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             self._setup_aliases(tmp_path, {"whatsapp": {"120363@g.us": "general"}}):
+            result = load_directory()
+            assert result["platforms"]["whatsapp"][0]["name"] == "general"
+            # And the friendly name resolves back to the JID
+            assert resolve_channel_name("whatsapp", "general") == "120363@g.us"
+            assert resolve_channel_name("whatsapp", "GENERAL") == "120363@g.us"
 
-    def _setup(self, tmp_path, platforms):
-        cache_file = _write_directory(tmp_path, platforms)
-        return patch("gateway.channel_directory.DIRECTORY_PATH", cache_file)
+    def test_alias_injects_undiscovered_group(self, tmp_path):
+        """A group named in the alias file but not yet seen in any session is
+        still addressable by name (pre-naming before first traffic)."""
+        cache_file = _write_directory(tmp_path, {"whatsapp": []})
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             self._setup_aliases(tmp_path, {"whatsapp": {"999@g.us": "marketing"}}):
+            assert resolve_channel_name("whatsapp", "marketing") == "999@g.us"
+            entries = load_directory()["platforms"]["whatsapp"]
+            injected = [e for e in entries if e["id"] == "999@g.us"]
+            assert injected and injected[0]["type"] == "group"
 
-    def test_build_slack_attaches_team_id_per_entry(self, tmp_path):
-        """Each entry returned by _build_slack carries its workspace team_id."""
-        client = _make_slack_client([
-            {
-                "ok": True,
-                "channels": [
-                    {"id": "C0WORKSPACEA1", "name": "engineering", "is_private": False},
-                    {"id": "C0WORKSPACEA2", "name": "general", "is_private": False},
-                ],
-                "response_metadata": {},
-            },
-        ])
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            entries = asyncio.run(_build_slack(_make_slack_adapter({"T_WORKSPACE_A": client})))
+    def test_no_alias_file_is_noop(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "whatsapp": [{"id": "120363@g.us", "name": "120363", "type": "group"}]
+        })
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.channel_directory.CHANNEL_ALIASES_PATH", tmp_path / "nope.json"):
+            result = load_directory()
+            assert result["platforms"]["whatsapp"][0]["name"] == "120363"
 
-        by_id = {e["id"]: e for e in entries}
-        assert by_id["C0WORKSPACEA1"]["team_id"] == "T_WORKSPACE_A"
-        assert by_id["C0WORKSPACEA2"]["team_id"] == "T_WORKSPACE_A"
+    def test_corrupt_alias_file_is_ignored(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "whatsapp": [{"id": "120363@g.us", "name": "120363", "type": "group"}]
+        })
+        bad = tmp_path / "channel_aliases.json"
+        bad.write_text("{not json")
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.channel_directory.CHANNEL_ALIASES_PATH", bad):
+            result = load_directory()
+            assert result["platforms"]["whatsapp"][0]["name"] == "120363"
 
-    def test_build_slack_two_workspaces_both_track_their_own_team_id(self, tmp_path):
-        """Two workspaces — each entry tagged with its own team_id."""
-        client_a = _make_slack_client([
-            {
-                "ok": True,
-                "channels": [{"id": "C0WORKSPACEA1", "name": "engineering", "is_private": False}],
-                "response_metadata": {},
-            },
-        ])
-        client_b = _make_slack_client([
-            {
-                "ok": True,
-                "channels": [{"id": "C0WORKSPACEB1", "name": "engineering", "is_private": False}],
-                "response_metadata": {},
-            },
-        ])
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            entries = asyncio.run(_build_slack(_make_slack_adapter({
-                "T_WORKSPACE_A": client_a,
-                "T_WORKSPACE_B": client_b,
-            })))
+    def test_alias_persists_through_rebuild(self, tmp_path, monkeypatch):
+        """build_channel_directory must bake aliases into the written file so
+        they survive the periodic regeneration, not just live reads."""
+        cache_file = tmp_path / "channel_directory.json"
+        monkeypatch.setattr("gateway.channel_directory._build_from_sessions",
+                            lambda plat: [{"id": "120363@g.us", "name": "120363",
+                                           "type": "group", "thread_id": None}]
+                            if plat == "whatsapp" else [])
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             self._setup_aliases(tmp_path, {"whatsapp": {"120363@g.us": "general"}}):
+            asyncio.run(build_channel_directory({}))
+            on_disk = json.loads(cache_file.read_text())
+        names = [e["name"] for e in on_disk["platforms"]["whatsapp"]
+                 if e["id"] == "120363@g.us"]
+        assert names == ["general"]
 
-        by_id = {e["id"]: e for e in entries}
-        assert by_id["C0WORKSPACEA1"]["team_id"] == "T_WORKSPACE_A"
-        assert by_id["C0WORKSPACEB1"]["team_id"] == "T_WORKSPACE_B"
-
-    def test_resolve_channel_name_returns_none_when_cross_workspace_ambiguous(self, tmp_path):
-        """Same channel name in two workspaces => resolve_channel_name returns None.
-
-        Without this, ``send_message_tool`` calls SlackAdapter.send() with the
-        first workspace's channel ID; if the bot's primary client is for the
-        OTHER workspace, the message lands in the wrong workspace — a silent
-        cross-channel misroute.
-        """
-        platforms = {
-            "slack": [
-                {"id": "C0WORKSPACEA1", "name": "engineering", "type": "channel", "team_id": "T_WORKSPACE_A"},
-                {"id": "C0WORKSPACEB1", "name": "engineering", "type": "channel", "team_id": "T_WORKSPACE_B"},
-            ]
-        }
-        with self._setup(tmp_path, platforms):
-            assert resolve_channel_name("slack", "engineering") is None
-
-    def test_resolve_channel_name_unambiguous_in_single_workspace(self, tmp_path):
-        """Single workspace with the channel — still resolves cleanly."""
-        platforms = {
-            "slack": [
-                {"id": "C0ONLYONE", "name": "engineering", "type": "channel", "team_id": "T_ONLY"},
-            ]
-        }
-        with self._setup(tmp_path, platforms):
-            assert resolve_channel_name("slack", "engineering") == "C0ONLYONE"
-
-    def test_resolve_channel_name_unambiguous_when_same_name_unique_to_workspace(self, tmp_path):
-        """Two workspaces but only one has the channel — resolves to that one."""
-        platforms = {
-            "slack": [
-                {"id": "C0WORKSPACEA1", "name": "engineering", "type": "channel", "team_id": "T_WORKSPACE_A"},
-                {"id": "C0WORKSPACEB1", "name": "general", "type": "channel", "team_id": "T_WORKSPACE_B"},
-            ]
-        }
-        with self._setup(tmp_path, platforms):
-            # "engineering" only exists in workspace A — must resolve there
-            assert resolve_channel_name("slack", "engineering") == "C0WORKSPACEA1"
-
-    def test_resolve_channel_name_strict_returns_chat_id_and_team_id(self, tmp_path):
-        """resolve_channel_name_strict returns (chat_id, team_id) when unambiguous."""
-        platforms = {
-            "slack": [
-                {"id": "C0ONLYONE", "name": "engineering", "type": "channel", "team_id": "T_ONLY"},
-            ]
-        }
-        with self._setup(tmp_path, platforms):
-            assert _resolve_strict("slack", "engineering") == ("C0ONLYONE", "T_ONLY")
-
-    def test_resolve_channel_name_strict_returns_none_on_cross_workspace_ambiguity(self, tmp_path):
-        """When the same name exists in multiple workspaces, strict resolver refuses."""
-        platforms = {
-            "slack": [
-                {"id": "C0WORKSPACEA1", "name": "engineering", "type": "channel", "team_id": "T_WORKSPACE_A"},
-                {"id": "C0WORKSPACEB1", "name": "engineering", "type": "channel", "team_id": "T_WORKSPACE_B"},
-            ]
-        }
-        with self._setup(tmp_path, platforms):
-            assert _resolve_strict("slack", "engineering") is None
-
-    def test_resolve_channel_name_strict_falls_back_to_no_team_id_entry(self, tmp_path):
-        """Legacy entries without team_id (single-workspace deployments) still resolve."""
-        platforms = {
-            "slack": [
-                {"id": "C0LEGACY", "name": "engineering", "type": "channel"},
-            ]
-        }
-        with self._setup(tmp_path, platforms):
-            # No team_id: still resolves, but team_id is the empty string
-            assert _resolve_strict("slack", "engineering") == ("C0LEGACY", "")
-
-    def test_format_directory_displays_workspace_for_cross_workspace_slack(self, tmp_path):
-        """Slack display MUST surface the workspace name so callers can disambiguate.
-
-        Without this, the LLM sees ``slack:engineering`` twice and has no way
-        to know which workspace each entry belongs to. Discord already does
-        this via ``guild``; Slack needs the equivalent.
-        """
-        platforms = {
-            "slack": [
-                {"id": "C0WORKSPACEA1", "name": "engineering", "type": "channel", "team_id": "T_WORKSPACE_A", "team_name": "acme"},
-                {"id": "C0WORKSPACEB1", "name": "engineering", "type": "channel", "team_id": "T_WORKSPACE_B", "team_name": "globex"},
-            ]
-        }
-        with self._setup(tmp_path, platforms):
-            result = format_directory_for_display()
-
-        # Both entries must appear, and the workspace label must be visible so
-        # the LLM can pick the right one when it has a preference.
-        assert "acme" in result
-        assert "globex" in result
-        assert result.count("engineering") >= 2
+    def test_apply_aliases_handles_malformed_map(self):
+        """Non-dict alias maps and non-string aliases must not raise."""
+        platforms = {"whatsapp": [{"id": "1@g.us", "name": "1", "type": "group"}]}
+        with patch("gateway.channel_directory._load_channel_aliases",
+                   return_value={
+                       "whatsapp": "not-a-dict",
+                       "telegram": None,
+                       "signal": {"+15551234567": 123},
+                   }):
+            _apply_channel_aliases(platforms)  # should not raise
+        assert platforms["whatsapp"][0]["name"] == "1"

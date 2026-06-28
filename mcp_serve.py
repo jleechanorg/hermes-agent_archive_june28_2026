@@ -89,7 +89,14 @@ def _load_sessions_index() -> dict:
         return {}
     try:
         with open(sessions_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        # Drop documentation/metadata sentinels (keys starting with "_", e.g.
+        # the "_README" note the gateway writes into the index). They are not
+        # session entries and would break consumers that treat every value as
+        # an entry dict.
+        if isinstance(data, dict):
+            return {k: v for k, v in data.items() if not str(k).startswith("_")}
+        return {}
     except Exception as e:
         logger.debug("Failed to load sessions.json: %s", e)
         return {}
@@ -169,7 +176,7 @@ def _extract_attachments(msg: dict) -> List[dict]:
                 url = part.get("url", part.get("source", {}).get("url", ""))
                 if url:
                     attachments.append({"type": "image", "url": url})
-            elif ptype not in ("text",):
+            elif ptype not in {"text",}:
                 # Unknown non-text content type
                 attachments.append({"type": ptype, "data": part})
 
@@ -414,7 +421,7 @@ class EventBridge:
             for msg in messages:
                 ts = _ts_float(msg.get("timestamp", 0))
                 role = msg.get("role", "")
-                if role not in ("user", "assistant"):
+                if role not in {"user", "assistant"}:
                     continue
                 if ts > last_seen:
                     new_messages.append(msg)
@@ -594,7 +601,7 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
         filtered = []
         for msg in all_messages:
             role = msg.get("role", "")
-            if role in ("user", "assistant"):
+            if role in {"user", "assistant"}:
                 content = _extract_message_content(msg)
                 if content:
                     filtered.append({
@@ -847,7 +854,7 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
             id: The approval ID from permissions_list_open
             decision: One of "allow-once", "allow-always", or "deny"
         """
-        if decision not in ("allow-once", "allow-always", "deny"):
+        if decision not in {"allow-once", "allow-always", "deny"}:
             return json.dumps({
                 "error": f"Invalid decision: {decision}. "
                          f"Must be allow-once, allow-always, or deny"
