@@ -244,6 +244,21 @@ def test_evaluate_all_stale_cache_serves_stale_and_refreshes_in_background(plugi
     }
     plugin_api.save_snapshot(stale_payload)
 
+    # Exercise the scheduling edge where the background refresh finishes
+    # before evaluate_all() returns.  The current request must still receive
+    # the stale snapshot it found; the refreshed snapshot is for the next
+    # request.
+    original_start = plugin_api._start_background_scan
+
+    def eager_background_scan():
+        original_start()
+        thread = plugin_api._BACKGROUND_SCAN_THREAD
+        assert thread is not None
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    plugin_api._start_background_scan = eager_background_scan
+
     t0 = time.time()
     result = plugin_api.evaluate_all()
     elapsed = time.time() - t0
