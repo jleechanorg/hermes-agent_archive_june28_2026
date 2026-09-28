@@ -8,6 +8,7 @@ that ``hermes update`` survives a terminal disconnect mid-install
 
 from __future__ import annotations
 
+import importlib
 import io
 import os
 import signal
@@ -22,6 +23,23 @@ from hermes_cli.main import (
     _finalize_update_output,
     _install_hangup_protection,
 )
+
+
+@pytest.fixture(autouse=True)
+def _refresh_bindings_against_live_module():
+    """Keep imports valid when another test reloads ``hermes_cli.main``."""
+    global _UpdateOutputStream
+    global _finalize_update_output
+    global _install_hangup_protection
+
+    live = sys.modules.get("hermes_cli.main")
+    if live is None:
+        live = importlib.import_module("hermes_cli.main")
+
+    _UpdateOutputStream = live._UpdateOutputStream
+    _finalize_update_output = live._finalize_update_output
+    _install_hangup_protection = live._install_hangup_protection
+    yield
 
 
 # -----------------------------------------------------------------------------
